@@ -176,6 +176,15 @@ interface ServeHttpOptions {
    * is almost always a misconfiguration.
    */
   bind?: string;
+  /**
+   * v0.36.x #1024: suppress the printed admin bootstrap token line on
+   * startup. Combined with `GBRAIN_ADMIN_BOOTSTRAP_TOKEN`, lets long-lived
+   * production deployments avoid leaking the token into log aggregators on
+   * every supervisor-managed restart. When the env var is NOT set, this
+   * flag still suppresses the print — operators take responsibility for
+   * tracking the regenerated value through other means.
+   */
+  suppressBootstrapToken?: boolean;
 }
 
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
@@ -227,9 +236,34 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     console.error('Token sweep failed (non-blocking):', e instanceof Error ? e.message : e);
   }
 
-  // Generate bootstrap token for admin dashboard
-  const bootstrapToken = randomBytes(32).toString('hex');
+  // v0.36.x #1024: bootstrap token sourcing.
+  //
+  // Default: regenerate per process start, print to stderr so the operator
+  // can paste into /admin login. Stable across restarts only when env var
+  // is set. The env override must be a strong secret — `[A-Za-z0-9_-]{32+}`
+  // — otherwise refuse to start. Logging the bootstrap-token value every
+  // restart is the original gripe; with `GBRAIN_ADMIN_BOOTSTRAP_TOKEN` set
+  // and `--suppress-bootstrap-token`, no value reaches the log.
+  const envBootstrap = process.env.GBRAIN_ADMIN_BOOTSTRAP_TOKEN;
+  let bootstrapToken: string;
+  let bootstrapFromEnv = false;
+  if (envBootstrap !== undefined) {
+    const trimmed = envBootstrap.trim();
+    if (!/^[A-Za-z0-9_-]{32,}$/.test(trimmed)) {
+      console.error(
+        'GBRAIN_ADMIN_BOOTSTRAP_TOKEN must be at least 32 chars and match [A-Za-z0-9_-]+.\n' +
+        '  Refusing to start with a weak admin bootstrap token. Generate one with:\n' +
+        '    head -c 32 /dev/urandom | base64 | tr -d "+/=" | head -c 48'
+      );
+      process.exit(1);
+    }
+    bootstrapToken = trimmed;
+    bootstrapFromEnv = true;
+  } else {
+    bootstrapToken = randomBytes(32).toString('hex');
+  }
   const bootstrapHash = createHash('sha256').update(bootstrapToken).digest('hex');
+  const suppressBootstrapPrint = options.suppressBootstrapToken === true;
   const adminSessions = new Map<string, number>(); // sessionId → expiresAt
 
   // SSE clients for live activity feed
@@ -1167,10 +1201,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 ║  MCP:       http://localhost:${port}/mcp${' '.repeat(Math.max(0, 21 - String(port).length))}║
 ║  Health:    http://localhost:${port}/health${' '.repeat(Math.max(0, 18 - String(port).length))}║
 ╠══════════════════════════════════════════════════════╣
-║  Admin Token (paste into /admin login):              ║
-║  ${bootstrapToken.substring(0, 50)}  ║
-║  ${bootstrapToken.substring(50).padEnd(50)}  ║
-╚══════════════════════════════════════════════════════╝
+${suppressBootstrapPrint
+  ? '║  Admin Token: suppressed (--suppress-bootstrap-token) ║\n╚══════════════════════════════════════════════════════╝'
+  : bootstrapFromEnv
+    ? '║  Admin Token: from $GBRAIN_ADMIN_BOOTSTRAP_TOKEN     ║\n╚══════════════════════════════════════════════════════╝'
+    : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`}
 `);
   });
 }
