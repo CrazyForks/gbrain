@@ -467,7 +467,12 @@ CREATE TABLE IF NOT EXISTS eval_candidates (
   salience_resolved     TEXT,
   recency_resolved      TEXT,
   salience_source       TEXT,
-  recency_source        TEXT
+  recency_source        TEXT,
+  -- v0.36.3.0 (D16 / CDX-10) — embedding column that ran at capture time.
+  -- Nullable; pre-v0.36 rows have NULL and replay falls back to current
+  -- default. See src/core/migrate.ts migration v68 for the matching ALTER
+  -- on upgrade brains.
+  embedding_column      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eval_candidates_created_at ON eval_candidates(created_at DESC);
 
@@ -754,6 +759,22 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
   expires_at             BIGINT NOT NULL,
   created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ============================================================
+-- op_checkpoints (v0.36+ autonomous-remediation wave, migration v67)
+-- Shared checkpoint table for long-running ops. See migrate.ts:67 for
+-- the design rationale; PGLite engine can also fall back to file-backed
+-- storage per src/core/op-checkpoint.ts.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS op_checkpoints (
+  op             TEXT NOT NULL,
+  fingerprint    TEXT NOT NULL,
+  completed_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (op, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
+  ON op_checkpoints (updated_at);
 
 -- ============================================================
 -- Trigger-based search_vector (spans pages + timeline_entries)

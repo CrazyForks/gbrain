@@ -471,6 +471,26 @@ CREATE INDEX IF NOT EXISTS idx_mcp_log_time_agent ON mcp_request_log(created_at,
 CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time ON mcp_request_log(agent_name, created_at DESC);
 
 -- ============================================================
+-- op_checkpoints: shared checkpoint table for long-running ops
+-- ============================================================
+-- v0.36+ autonomous-remediation wave (migration v67). Pre-fix each op
+-- carried its own file-backed checkpoint (or none); that broke on
+-- Postgres multi-worker hosts and fingerprint-collided across param
+-- variations. Fingerprint = sha8 of canonical-JSON of relevant params
+-- per op (mode, source, chunker_version, embedding_model+dims, etc.).
+-- completed_keys = op-defined string array. GC: cycle purge phase
+-- drops rows older than 7 days.
+CREATE TABLE IF NOT EXISTS op_checkpoints (
+  op             TEXT NOT NULL,
+  fingerprint    TEXT NOT NULL,
+  completed_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (op, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
+  ON op_checkpoints (updated_at);
+
+-- ============================================================
 -- files: binary attachments stored in Supabase Storage
 -- ============================================================
 -- v0.18.0 Step 7: files gains source_id + page_id alongside the
@@ -791,7 +811,13 @@ CREATE TABLE IF NOT EXISTS eval_candidates (
   salience_resolved     TEXT,
   recency_resolved      TEXT,
   salience_source       TEXT,
-  recency_source        TEXT
+  recency_source        TEXT,
+  -- v0.36.3.0 (D16 / CDX-10) — embedding column resolved at capture time so
+  -- \`gbrain eval replay\` reproduces the same column the capture ran against.
+  -- Nullable; pre-v0.36 rows have NULL and replay falls back to current
+  -- default. Migration v68 (src/core/migrate.ts) adds the same column on
+  -- upgrade brains.
+  embedding_column      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eval_candidates_created_at ON eval_candidates(created_at DESC);
 

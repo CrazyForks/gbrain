@@ -1143,6 +1143,11 @@ const query: Operation = {
       description:
         "v0.34: scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile). Pass '__all__' to force cross-source search in multi-source brains.",
     },
+    embedding_column: {
+      type: 'string',
+      description:
+        "v0.36: route vector search through a non-default embedding column. Defaults to 'embedding' (OpenAI 1536d) unless `search_embedding_column` config sets a different default. Per-call override for A/B benchmarking across providers (e.g. 'embedding_voyage', 'embedding_zeroentropy'). Column MUST be declared in the `embedding_columns` config registry — unknown names throw with a paste-ready hint listing valid columns.",
+    },
   },
   handler: async (ctx, p) => {
     const startedAt = Date.now();
@@ -1151,6 +1156,19 @@ const query: Operation = {
     const queryText = p.query as string | undefined;
     const imageData = p.image as string | undefined;
     const imageMime = (p.image_mime as string) || 'image/jpeg';
+    const embeddingColumnParam =
+      typeof p.embedding_column === 'string' && p.embedding_column.length > 0
+        ? (p.embedding_column as string)
+        : undefined;
+    // Explicit per-call source_id must win over ctx.sourceId. The special
+    // __all__ value opts out of source filtering for local cross-source search.
+    const sourceIdParam = typeof p.source_id === 'string' ? p.source_id : undefined;
+    const querySourceScope =
+      sourceIdParam !== undefined
+        ? sourceIdParam === '__all__'
+          ? {}
+          : { sourceId: sourceIdParam }
+        : sourceScopeOpts(ctx);
 
     // v0.27.1: image-similarity branch. Bypasses hybridSearch (which is
     // text-only); embeds the image via embedMultimodal and runs a direct
@@ -1168,7 +1186,7 @@ const query: Operation = {
         limit: (p.limit as number) || 20,
         offset: (p.offset as number) || 0,
         embeddingColumn: 'embedding_image',
-        ...sourceScopeOpts(ctx),
+        ...querySourceScope,
       });
       return results;
     }
@@ -1187,16 +1205,6 @@ const query: Operation = {
     // search). When the param is the literal '__all__', force-allow
     // cross-source mode (matches SearchOpts.sourceId contract).
     let capturedMeta: HybridSearchMeta | null = null;
-    // v0.34 (Codex finding #2): thread ctx.sourceId so multi-source brains
-    // get source-scoped retrieval. Explicit `source_id` param wins over
-    // ctx.sourceId; literal `__all__` opts out (cross-source).
-    const sourceIdParam = typeof p.source_id === 'string' ? p.source_id : undefined;
-    const resolvedSourceId =
-      sourceIdParam !== undefined
-        ? sourceIdParam === '__all__'
-          ? undefined
-          : sourceIdParam
-        : ctx.sourceId;
     // v0.32.x search-lite: route the query op through hybridSearchCached so
     // semantic cache + token budget + intent weighting fire automatically.
     // Plain hybridSearch remains the bare API for callers that opt out.
@@ -1210,7 +1218,7 @@ const query: Operation = {
       symbolKind: (p.symbol_kind as string) || undefined,
       nearSymbol: (p.near_symbol as string) || undefined,
       walkDepth: typeof p.walk_depth === 'number' ? (p.walk_depth as number) : undefined,
-      sourceId: resolvedSourceId,
+      ...querySourceScope,
       // v0.29.1 — agent-explicit recency + salience. Omitted = heuristic defaults.
       salience: p.salience as 'off' | 'on' | 'strong' | undefined,
       recency: p.recency as 'off' | 'on' | 'strong' | undefined,
@@ -1221,10 +1229,12 @@ const query: Operation = {
       useCache: typeof p.use_cache === 'boolean' ? (p.use_cache as boolean) : undefined,
       intentWeighting: typeof p.intent_weighting === 'boolean' ? (p.intent_weighting as boolean) : undefined,
       onMeta: (m) => { capturedMeta = m; },
-      // v0.34.1 (#861 — P0 leak seal): thread caller's source scope. The
-      // hybridSearch internal searchOpts rebuild (hybrid.ts:223) was
-      // dropping these fields pre-fix even when callers passed them.
-      ...sourceScopeOpts(ctx),
+      // v0.36 (D15): per-call embedding column override. Resolver rejects
+      // unknown names at hybrid entry with EmbeddingColumnNotRegisteredError;
+      // the error surfaces back to the agent as the op error envelope.
+      // Source scope is already threaded via ...querySourceScope above
+      // (master's #1182 cleanup of the duplicate sourceScopeOpts spread).
+      embeddingColumn: embeddingColumnParam,
     });
     const latency_ms = Date.now() - startedAt;
 
@@ -2082,13 +2092,57 @@ const submit_job: Operation = {
     // Trusted flag fires ONLY for an explicit local CLI submission of a protected
     // name. Strict `=== false` so an untyped/cast context can't escalate.
     const trusted = ctx.remote === false && isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
-    return queue.add(name, (p.data as Record<string, unknown>) || {}, {
+
+    const jobData = (p.data as Record<string, unknown>) || {};
+
+    // v0.35.8.0: pre-enqueue shell-job validation, parity with the CLI submit
+    // path. Closes the bug class where shell.ts handler-time validation ran
+    // AFTER queue.add() persisted the row (codex F-CDX-1). Note: this branch
+    // only fires for trusted local submitters (`ctx.remote === false` AND
+    // protected-name allowlist), so remote MCP callers never reach it — but
+    // it stays here as defense-in-depth in case a future code path widens
+    // the trust gate above.
+    if (name === 'shell' && trusted) {
+      const { validateShellJobParams } = await import('./minions/handlers/shell-validate.ts');
+      validateShellJobParams(jobData);
+    }
+
+    const job = await queue.add(name, jobData, {
       queue: (p.queue as string) || 'default',
       priority: (p.priority as number) || 0,
       max_attempts: (p.max_attempts as number) || 3,
       delay: (p.delay as number) || undefined,
       timeout_ms: (p.timeout_ms as number) || undefined,
     }, trusted);
+
+    // v0.35.8.0: submit_job audit-log parity with the CLI path (codex F-CDX-4).
+    // Pre-v0.35.8.0 the op handler bypassed the shell-audit JSONL writer
+    // entirely. Lift the call here so both submit surfaces produce one
+    // operational-trace line per shell submission. Best-effort; audit
+    // failures never block submission.
+    if (name === 'shell' && trusted) {
+      try {
+        const { logShellSubmission } = await import('./minions/handlers/shell-audit.ts');
+        const inheritNames = Array.isArray(jobData.inherit)
+          ? (jobData.inherit as unknown[]).filter((s): s is string => typeof s === 'string')
+          : undefined;
+        logShellSubmission({
+          caller: 'mcp',
+          // Gated on `trusted` (which requires ctx.remote === false), so
+          // we know this path is a local trusted submitter — log it that way.
+          remote: false,
+          job_id: job.id,
+          cwd: typeof jobData.cwd === 'string' ? jobData.cwd : '',
+          cmd_display: typeof jobData.cmd === 'string' ? (jobData.cmd as string).slice(0, 80) : undefined,
+          argv_display: Array.isArray(jobData.argv)
+            ? (jobData.argv as unknown[]).filter((a): a is string => typeof a === 'string').map((a) => a.slice(0, 80))
+            : undefined,
+          inherit: inheritNames && inheritNames.length > 0 ? inheritNames : undefined,
+        });
+      } catch { /* audit failures never block submission */ }
+    }
+
+    return job;
   },
 };
 
