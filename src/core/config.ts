@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join } from 'path';
 import { homedir } from 'os';
 import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
 
@@ -143,11 +143,35 @@ export function isThinClient(config: GBrainConfig | null): boolean {
  * Load config with credential precedence: env vars > config file.
  * Plugin config is handled by the plugin runtime injecting env vars.
  */
+// v0.36.x #1086: translate legacy `provider` + `model` config shape (seen in
+// pre-v0.32 docs and some community templates) to the canonical
+// `embedding_model: "<provider>:<model>"`. Without this translation, sync
+// and embed silently fell through to the hardcoded OpenAI default, blocking
+// Voyage / Cohere / Mistral users from using their configured provider.
+function migrateLegacyEmbeddingConfig(raw: Record<string, unknown>): Record<string, unknown> {
+  if (raw.embedding_model !== undefined) return raw;
+  const provider = typeof raw.provider === 'string' ? raw.provider : undefined;
+  const model = typeof raw.model === 'string' ? raw.model : undefined;
+  if (!provider || !model) return raw;
+  // Strip the legacy keys to avoid downstream confusion. Emit a one-line
+  // stderr nudge so the operator updates their config to the canonical shape.
+  const rest = { ...raw };
+  delete rest.provider;
+  delete rest.model;
+  rest.embedding_model = `${provider}:${model}`;
+  console.warn(
+    `[config] legacy "provider" + "model" detected; using "${rest.embedding_model}".` +
+    ` Rewrite ~/.gbrain/config.json to: "embedding_model": "${rest.embedding_model}".`,
+  );
+  return rest;
+}
+
 export function loadConfig(): GBrainConfig | null {
   let fileConfig: GBrainConfig | null = null;
   try {
     const raw = readFileSync(getConfigPath(), 'utf-8');
-    fileConfig = JSON.parse(raw) as GBrainConfig;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    fileConfig = migrateLegacyEmbeddingConfig(parsed) as unknown as GBrainConfig;
   } catch { /* no config file */ }
 
   // Try env vars
@@ -322,10 +346,10 @@ export function configDir(): string {
   const override = process.env.GBRAIN_HOME;
   if (override && override.trim()) {
     const trimmed = override.trim();
-    if (!trimmed.startsWith('/')) {
+    if (!isAbsolute(trimmed)) {
       throw new Error(`GBRAIN_HOME must be an absolute path; got: ${trimmed}`);
     }
-    if (trimmed.split('/').includes('..')) {
+    if (trimmed.split(/[\\/]/).includes('..')) {
       throw new Error(`GBRAIN_HOME must not contain '..' segments; got: ${trimmed}`);
     }
     return join(trimmed, '.gbrain');

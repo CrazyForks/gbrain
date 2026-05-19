@@ -551,27 +551,28 @@ async function runPhaseLint(brainDir: string, dryRun: boolean): Promise<PhaseRes
 
 async function runPhaseBacklinks(brainDir: string, dryRun: boolean): Promise<PhaseResult> {
   try {
-    // Library function path — the v0.15 backlinks.ts exports
-    // runBacklinksCore when --fix is requested.
+    // Maintenance cycles must not rewrite tracked brain pages with generated
+    // "Referenced in" timeline bullets. The graph extractor/auto-link path is
+    // the canonical link store during sync/dream/autopilot; the legacy
+    // filesystem fixer remains available explicitly via `gbrain check-backlinks
+    // fix` for users who truly want markdown backlinks materialized.
     const { runBacklinksCore } = await import('../commands/backlinks.ts');
     const result = await runBacklinksCore({
-      action: 'fix',
+      action: 'check',
       dir: brainDir,
       dryRun,
     });
     const gaps = result.gaps_found ?? 0;
     const added = result.fixed ?? 0;
-    const remaining = Math.max(0, gaps - added);
-    const status: PhaseStatus =
-      gaps === 0 || (!dryRun && remaining === 0) ? 'ok' : 'warn';
+    const status: PhaseStatus = 'ok';
     return {
       phase: 'backlinks',
       status,
       duration_ms: 0,
-      summary: dryRun
-        ? `${gaps} missing back-link(s) (dry-run)`
-        : `${added} back-link(s) added, ${remaining} remaining`,
-      details: { gaps, added, pages_affected: result.pages_affected, dryRun },
+      summary: gaps === 0
+        ? 'no missing back-links found'
+        : `${gaps} missing back-link(s) found (audit-only; run gbrain check-backlinks fix to materialize)`,
+      details: { gaps, added, pages_affected: result.pages_affected, dryRun, mode: 'audit-only' },
     };
   } catch (e) {
     return {
@@ -1004,9 +1005,19 @@ async function runPhaseOrphans(engine: BrainEngine): Promise<PhaseResult> {
     const { findOrphans } = await import('../commands/orphans.ts');
     const result = await findOrphans(engine);
     const count = result.total_orphans;
+    // Orphans are a code-smell signal, not a fatal condition. The
+    // original `count > 20` cutoff was tuned for small dev brains; on
+    // any corpus past a few hundred pages it fires 'warn' every cycle
+    // in steady state. Combined with the autopilot circuit-breaker
+    // historically tripping on cycle.status='partial', that produced
+    // respawn storms under KeepAlive=true. Switch to a ratio: warn
+    // only when more than half the corpus is orphaned (the real "your
+    // graph fell apart" signal). total_pages=0 is a defensive 'ok'.
+    const status: PhaseStatus =
+      result.total_pages > 0 && count / result.total_pages > 0.5 ? 'warn' : 'ok';
     return {
       phase: 'orphans',
-      status: count > 20 ? 'warn' : 'ok',
+      status,
       duration_ms: 0,
       summary: `${count} orphan page(s) out of ${result.total_pages} total`,
       details: {

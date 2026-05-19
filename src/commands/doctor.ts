@@ -9,8 +9,9 @@ import { compareVersions } from './migrations/index.ts';
 import { createProgress, startHeartbeat, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import type { DbUrlSource } from '../core/config.ts';
-import { join } from 'path';
-import { existsSync, readFileSync, readdirSync } from 'fs';
+import { dirname, isAbsolute, join, resolve as resolvePath } from 'path';
+import { fileURLToPath } from 'url';
+import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 
 export interface Check {
   name: string;
@@ -86,6 +87,41 @@ export function computeDoctorReport(checks: Check[]): DoctorReport {
  * Tolerance matches migration v48: any value with abs(weight - on_grid) > 1e-3
  * is genuinely off-grid (the 0.05 grid is 5e-2; float32 noise is ~1e-7).
  */
+const WHOKNOWS_FIXTURE_RELATIVE_PATH = 'test/fixtures/whoknows-eval.jsonl';
+
+function isGbrainSourceRoot(dir: string): boolean {
+  return (
+    existsSync(join(dir, 'src', 'cli.ts')) &&
+    existsSync(join(dir, 'skills', 'RESOLVER.md'))
+  );
+}
+
+export function resolveWhoknowsFixturePath(
+  env: NodeJS.ProcessEnv = process.env,
+  moduleUrl: string = import.meta.url,
+): string | null {
+  if (env.GBRAIN_WHOKNOWS_FIXTURE_PATH) {
+    return isAbsolute(env.GBRAIN_WHOKNOWS_FIXTURE_PATH)
+      ? env.GBRAIN_WHOKNOWS_FIXTURE_PATH
+      : resolvePath(process.cwd(), env.GBRAIN_WHOKNOWS_FIXTURE_PATH);
+  }
+
+  try {
+    let dir = dirname(fileURLToPath(moduleUrl));
+    for (let i = 0; i < 10; i++) {
+      if (isGbrainSourceRoot(dir)) return join(dir, WHOKNOWS_FIXTURE_RELATIVE_PATH);
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    // Some bundlers/runtimes may not expose a normal file: import URL.
+    // Doctor should surface an override hint instead of fabricating a path.
+  }
+
+  return null;
+}
+
 /**
  * v0.33: whoknows_health — verify the eval fixture is present at the
  * documented path. Lightweight; just checks file existence and row count,
@@ -98,15 +134,19 @@ export function computeDoctorReport(checks: Check[]): DoctorReport {
  */
 export async function whoknowsHealthCheck(_engine: BrainEngine): Promise<Check> {
   try {
-    const { existsSync, readFileSync, statSync } = await import('fs');
-    const path = await import('path');
-    const repoRoot = process.cwd();
-    const fixturePath = path.join(repoRoot, 'test/fixtures/whoknows-eval.jsonl');
+    const fixturePath = resolveWhoknowsFixturePath();
+    if (!fixturePath) {
+      return {
+        name: 'whoknows_health',
+        status: 'warn',
+        message: 'whoknows eval fixture path could not be resolved. Set GBRAIN_WHOKNOWS_FIXTURE_PATH to the absolute path for test/fixtures/whoknows-eval.jsonl.',
+      };
+    }
     if (!existsSync(fixturePath)) {
       return {
         name: 'whoknows_health',
         status: 'warn',
-        message: `whoknows eval fixture missing at test/fixtures/whoknows-eval.jsonl. Fix: hand-label 10 queries you'd actually run, format {query, expected_top_3_slugs, notes}.`,
+        message: `whoknows eval fixture missing at ${fixturePath}. Fix: hand-label 10 queries you'd actually run, format {query, expected_top_3_slugs, notes}.`,
       };
     }
     const stat = statSync(fixturePath);
@@ -191,6 +231,97 @@ export async function takesWeightGridCheck(engine: BrainEngine): Promise<Check> 
       message: `Could not check takes weight grid: ${msg}`,
     };
   }
+}
+
+/**
+ * Child-table orphan detection (closes #1063).
+ *
+ * The autopilot `orphans` phase (src/core/cycle.ts:runPhaseOrphans) detects
+ * orphan PAGES (pages with no inbound links via the page-graph). It does NOT
+ * scan FK-child tables for orphan rows. When a bulk page delete leaves
+ * orphans in `content_chunks` / `page_versions` / `tags` / `takes` / etc.
+ * — whether from pre-FK migrations, race conditions, or a code path that
+ * bypassed cascade — they persist indefinitely until manual SQL cleanup.
+ *
+ * All ten FK-to-pages tables declare `ON DELETE CASCADE` in the live schema
+ * (verified via `pg_constraint` snapshot in the issue body), so finding any
+ * orphan row is by definition unexpected. The check ships paste-ready
+ * cleanup SQL when orphans surface.
+ *
+ * Excluded: `files.page_id` and `links.origin_page_id` — both declared as
+ * `ON DELETE SET NULL`, so a NULL value is a valid state (file/link survives
+ * after page deletion); only NOT-NULL-but-page-missing is an orphan there.
+ * The check encodes that distinction for the two SET NULL columns.
+ *
+ * Pure helper for parity with `takesWeightGridCheck` so tests can target it
+ * directly without driving the full `runDoctor` pipeline.
+ */
+export async function childTableOrphansCheck(engine: BrainEngine): Promise<Check> {
+  // (table, fk_column, allow_null). When allow_null=true, NULL is a valid
+  // state (FK was declared ON DELETE SET NULL); the orphan predicate filters
+  // out NULL values. When false, NULL is impossible by NOT NULL constraint;
+  // any value not in pages.id is an orphan.
+  const targets: Array<{ table: string; col: string; allowNull: boolean }> = [
+    { table: 'content_chunks',   col: 'page_id',          allowNull: false },
+    { table: 'page_versions',    col: 'page_id',          allowNull: false },
+    { table: 'tags',             col: 'page_id',          allowNull: false },
+    { table: 'takes',            col: 'page_id',          allowNull: false },
+    { table: 'raw_data',         col: 'page_id',          allowNull: false },
+    { table: 'timeline_entries', col: 'page_id',          allowNull: false },
+    { table: 'links',            col: 'from_page_id',     allowNull: false },
+    { table: 'links',            col: 'to_page_id',       allowNull: false },
+    { table: 'links',            col: 'origin_page_id',   allowNull: true  },
+    { table: 'files',            col: 'page_id',          allowNull: true  },
+  ];
+  let totalOrphans = 0;
+  const breakdown: string[] = [];
+  const cleanupSql: string[] = [];
+  const errors: string[] = [];
+  for (const { table, col, allowNull } of targets) {
+    try {
+      // NOT IN subquery is portable across postgres + PGLite. The `pages.id`
+      // subquery covers every existing parent row.
+      const nullFilter = allowNull ? `${col} IS NOT NULL AND ` : '';
+      const rows = await engine.executeRaw<{ n: string | number }>(
+        `SELECT COUNT(*)::int AS n FROM ${table} WHERE ${nullFilter}${col} NOT IN (SELECT id FROM pages)`,
+      );
+      const n = Number(rows[0]?.n ?? 0);
+      if (n > 0) {
+        totalOrphans += n;
+        breakdown.push(`${table}.${col}=${n}`);
+        cleanupSql.push(
+          `DELETE FROM ${table} WHERE ${nullFilter}${col} NOT IN (SELECT id FROM pages);`,
+        );
+      }
+    } catch (e) {
+      // Table or column may not exist on older schemas — skip and continue.
+      // Aggregate the errors so doctor surfaces "could not check N tables"
+      // when a real failure shape appears (network, lock, syntax).
+      const msg = e instanceof Error ? e.message : String(e);
+      errors.push(`${table}.${col}: ${msg.slice(0, 80)}`);
+    }
+  }
+  if (totalOrphans === 0 && errors.length === 0) {
+    return {
+      name: 'child_table_orphans',
+      status: 'ok',
+      message: 'All FK-child tables clean (10 tables checked)',
+    };
+  }
+  if (totalOrphans === 0 && errors.length > 0) {
+    return {
+      name: 'child_table_orphans',
+      status: 'warn',
+      message: `Could not check ${errors.length}/10 FK-child tables (older schema or transient error): ${errors.slice(0, 3).join('; ')}`,
+    };
+  }
+  return {
+    name: 'child_table_orphans',
+    status: 'warn',
+    message:
+      `${totalOrphans} orphan row(s) in FK-child tables (${breakdown.join(', ')}). ` +
+      `Cleanup: ${cleanupSql.join(' ')}`,
+  };
 }
 
 export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorReport> {
@@ -681,6 +812,136 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       name: 'reranker_health',
       status: 'warn',
       message: `Could not check reranker audit: ${msg}`,
+    };
+  }
+}
+
+/**
+ * v0.36.0.0 (A5): ze_embedding_health doctor check.
+ *
+ * When the configured embedding_model starts with `zeroentropyai:`, verify
+ * the API key is set. Doesn't make a network call by default — the existing
+ * `gbrain models doctor` probe covers that, and we don't want every
+ * `gbrain doctor` run to spend tokens. Surfaces a paste-ready fix when the
+ * key is missing.
+ */
+export async function checkZeEmbeddingHealth(engine: BrainEngine): Promise<Check> {
+  try {
+    const model = await engine.getConfig('embedding_model') ?? '';
+    if (!model.startsWith('zeroentropyai:')) {
+      return {
+        name: 'ze_embedding_health',
+        status: 'ok',
+        message: `Configured embedding model "${model || 'default'}" is not ZeroEntropy — skip.`,
+      };
+    }
+    const envKey = process.env.ZEROENTROPY_API_KEY;
+    const configKey = await engine.getConfig('zeroentropy_api_key');
+    if (!envKey && !configKey) {
+      return {
+        name: 'ze_embedding_health',
+        status: 'warn',
+        message:
+          `embedding_model="${model}" but ZEROENTROPY_API_KEY is not set. ` +
+          `Fix: get a key at https://dashboard.zeroentropy.dev and run ` +
+          `\`gbrain config set zeroentropy_api_key <YOUR_KEY>\` (or export ZEROENTROPY_API_KEY).`,
+      };
+    }
+    return {
+      name: 'ze_embedding_health',
+      status: 'ok',
+      message: `embedding_model="${model}" with key configured`,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'ze_embedding_health',
+      status: 'warn',
+      message: `Could not check ZE embedding health: ${msg}`,
+    };
+  }
+}
+
+/**
+ * v0.36.0.0 (A5): embedding_width_consistency doctor check.
+ *
+ * Cross-checks that `config.embedding_dimensions` matches the actual
+ * `vector(N)` width on `content_chunks.embedding`. Drift here means the
+ * ze-switch was interrupted mid-flight (schema changed but config write
+ * crashed, or vice versa). Surfaces a paste-ready `gbrain ze-switch
+ * --resume` hint.
+ */
+export async function checkEmbeddingWidthConsistency(engine: BrainEngine): Promise<Check> {
+  try {
+    const configDimStr = await engine.getConfig('embedding_dimensions');
+    if (!configDimStr) {
+      // Pre-v0.27 brain or never configured. Not our problem.
+      return {
+        name: 'embedding_width_consistency',
+        status: 'ok',
+        message: 'embedding_dimensions not configured — using defaults.',
+      };
+    }
+    const configDim = parseInt(configDimStr, 10);
+    if (!Number.isFinite(configDim) || configDim <= 0) {
+      return {
+        name: 'embedding_width_consistency',
+        status: 'warn',
+        message: `embedding_dimensions config value "${configDimStr}" is not a positive integer. Fix: \`gbrain config set embedding_dimensions <N>\`.`,
+      };
+    }
+
+    // Read the actual column width from pg_attribute / information_schema.
+    // Postgres + PGLite both expose vector typmod via atttypmod (vectors
+    // store dim as typmod). atttypmod==-1 means no constraint; >=0 is the
+    // dim+VARHDRSZ — we use format_type for portability.
+    const rows = await engine.executeRaw<{ format_type: string }>(
+      `SELECT format_type(atttypid, atttypmod) AS format_type
+         FROM pg_attribute
+        WHERE attrelid = 'content_chunks'::regclass
+          AND attname = 'embedding'
+          AND NOT attisdropped`,
+    );
+    if (rows.length === 0) {
+      return {
+        name: 'embedding_width_consistency',
+        status: 'warn',
+        message: 'content_chunks.embedding column not found. Fix: run `gbrain init --migrate-only` or check schema.',
+      };
+    }
+    const formatType = rows[0].format_type;
+    // Parse 'vector(N)' shape.
+    const m = formatType.match(/vector\((\d+)\)/i);
+    if (!m) {
+      return {
+        name: 'embedding_width_consistency',
+        status: 'warn',
+        message: `Unexpected column type for content_chunks.embedding: "${formatType}".`,
+      };
+    }
+    const schemaDim = parseInt(m[1], 10);
+    if (schemaDim !== configDim) {
+      return {
+        name: 'embedding_width_consistency',
+        status: 'warn',
+        message:
+          `Schema width mismatch: content_chunks.embedding is vector(${schemaDim}) but ` +
+          `embedding_dimensions config = ${configDim}. ` +
+          `Fix: \`gbrain ze-switch --resume\` if you were mid-switch, or ` +
+          `\`gbrain config set embedding_dimensions ${schemaDim}\` to match the schema.`,
+      };
+    }
+    return {
+      name: 'embedding_width_consistency',
+      status: 'ok',
+      message: `Schema width (${schemaDim}d) matches embedding_dimensions config`,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      name: 'embedding_width_consistency',
+      status: 'warn',
+      message: `Could not check embedding width: ${msg}`,
     };
   }
 }
@@ -2159,6 +2420,15 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
   progress.heartbeat('takes_weight_grid');
   checks.push(await takesWeightGridCheck(engine));
 
+  // 10c. Child-table orphan detection (closes #1063).
+  // The autopilot `orphans` phase scans for orphan pages (no inbound links)
+  // but does NOT detect orphan rows in FK-child tables. After a bulk page
+  // delete, child rows can persist if cascade didn't fire (pre-FK rows,
+  // race during bulk cascade, code path that bypassed cascade). This
+  // surfaces them with paste-ready cleanup SQL.
+  progress.heartbeat('child_table_orphans');
+  checks.push(await childTableOrphansCheck(engine));
+
   // v0.33: whoknows_health — fixture presence + row count. The eval
   // gate itself runs via `gbrain eval whoknows`; this check is the
   // "did you do the assignment?" signal.
@@ -2919,6 +3189,11 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     // v0.35.0.0+ reranker_health — read JSONL audit; warn on auth or volume.
     progress.heartbeat('reranker_health');
     checks.push(await checkRerankerHealth(engine));
+    // v0.36.0.0 (A5): ZE embedding key health + schema/config width consistency.
+    progress.heartbeat('ze_embedding_health');
+    checks.push(await checkZeEmbeddingHealth(engine));
+    progress.heartbeat('embedding_width_consistency');
+    checks.push(await checkEmbeddingWidthConsistency(engine));
   }
 
   progress.finish();
