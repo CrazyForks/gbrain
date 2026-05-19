@@ -175,9 +175,9 @@ the published yardstick for memory systems.
 Mastra (94.87%) and Supermemory (~99%) publish on this dataset but measure
 end-to-end QA accuracy with an LLM judge, which is a different thing than
 "did retrieval find the right session." Not directly comparable; flagged
-honestly in the [cross-system table](https://github.com/garrytan/gbrain-evals/blob/master/docs/comparison-systems.md).
+honestly in the [cross-system table](https://github.com/garrytan/gbrain-evals/blob/main/docs/comparison-systems.md).
 Reports + reproduction:
-[2026-05-07 LongMemEval](https://github.com/garrytan/gbrain-evals/blob/master/docs/benchmarks/2026-05-07-longmemeval-s.md).
+[2026-05-07 LongMemEval](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-07-longmemeval-s.md).
 
 ### BrainBench — relational queries (in-house corpus)
 
@@ -197,14 +197,33 @@ invested in?" — against it. Reproducible, deterministic.
 The knowledge graph layer is worth **31 points P@5** on these queries.
 Separable, measured, load-bearing. Flat across seven releases (v0.16 → v0.20)
 — zero retrieval regression while ops + infra changed underneath.
-[Full report.](https://github.com/garrytan/gbrain-evals/blob/master/docs/benchmarks/2026-04-23-brainbench-v0.20.0.md)
+[Full report.](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-04-23-brainbench-v0.20.0.md)
 
 ### Curated content vs bulk swamp
 
 Personal brains accumulate bulk content (tweet dumps, daily chat
 transcripts, archived articles). When a query phrase appears in both a
 short curated essay AND a long chat dump, which wins? Source-aware ranking
-keeps the essay on top. **93.3% top-1 hit** (vs 80% on grep-only). [Report.](https://github.com/garrytan/gbrain-evals/blob/master/docs/benchmarks/2026-04-25-brainbench-cat13b-source-swamp.md)
+keeps the essay on top. **93.3% top-1 hit** (vs 80% on grep-only). [Report.](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-04-25-brainbench-cat13b-source-swamp.md)
+
+### Calibration loop — the brain that knows how you've been wrong
+
+v0.36.1.0's calibration wave extracts gradeable claims from your prose,
+grades them against reality over time, and applies the resulting bias
+profile when the AI gives you advice. **First published benchmark for AI
+memory systems that reason about user track records.**
+
+| Eval | Result | Cost |
+|---|---|---|
+| **cat14 — advice quality A/B** | **75% calibrated wins / 0% baseline wins / 25% tie** | ~$0.05 per run |
+| **cat15 — propose_takes F1** | **0.952 training / 0.922 holdout** (gap 0.03, no overfitting) | ~$0.10 per run |
+
+Voice gate 100%, force-fit prevention 100%. Hindsight introduced the
+concept as a skill demo without quantified evaluation; cat14 + cat15
+stake out the category. The iteration log at `cat14-calibration/`
+captures three same-day prompt variants where the eval caught two
+regressions before either could ship.
+[Full report.](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-18-brainbench-cat14-cat15-calibration.md)
 
 ### Prompt compression
 

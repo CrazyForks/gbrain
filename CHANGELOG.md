@@ -90,6 +90,114 @@ What this means: you can run a side-by-side provider eval today. Set `embedding_
    ```
 
 If any step fails, file an issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+## [0.36.1.0] - 2026-05-17
+
+**The brain learns how you tend to be wrong, then argues against your blind spots on every advice call.**
+
+Hindsight-inspired calibration loop. Three new cycle phases, eight expansions, one big admin tab. gbrain stops being a smart database and starts being a mirror that knows your track record. The brain extracts gradeable claims from your prose, grades them against reality, aggregates your record into a calibration profile, and surfaces it everywhere advice gets given — `gbrain think --with-calibration` rewrites questions against your known biases, contradictions point at the bias pattern that produced them, real-time nudges fire when you commit a high-conviction take in a domain where you've been wrong before.
+
+### What you can now do
+
+**Run `gbrain calibration`** and see your own track record narrated in conversational voice: "You called early-stage tactics well — 8 of 10 held up. Geography is your blind spot — 4 of 6 missed." Not "Brier 0.18." Not "conviction-bucket 0.8-0.9." Friend-not-doctor by design, voice-gated against academic slop.
+
+**Run `gbrain think --with-calibration "should we hire fast in NY?"`** and the answer surfaces both your prior AND the counter-prior from your hedged-domain self. The bias filter applies to question framing, not evidence interpretation (D22 placement: AFTER retrieval, BEFORE the question). Off by default — flip it when you trust the profile.
+
+**Open the admin SPA Calibration tab** at `gbrain serve --http`'s `/admin` and see your Brier-trend sparkline, per-domain accuracy bars, pattern statements, and "you committed to these and never revisited" abandoned-threads card. Server-rendered SVG, zero new chart library dep, follows the existing Linear-calm-clarity admin design.
+
+**Commit a high-conviction take in a known-biased domain** and a conversational stderr nudge fires: "Hey — you just bet pretty hard on this NY tech thing (0.85). Last year you made three similar geographic calls; two of them missed. Maybe dial it back to a 0.65 hunch?" 14-day cooldown per pattern so you don't get re-nudged on the same call.
+
+**Run `gbrain calibration --undo-wave v0.36.1.0`** to fully reverse the wave's mutations. Every new row carries `wave_version='v0.36.1.0'`; the undo command reverts auto-applied take resolutions, deletes calibration profiles, purges nudge logs, optionally scrubs gstack-coupled learnings. Dry-run mode shows what would change before you commit.
+
+### Validated by published benchmarks
+
+**First published benchmark for AI memory systems that reason about user track records.** Sibling repo [gbrain-evals](https://github.com/garrytan/gbrain-evals) ships two new categories specifically gating this wave:
+
+- **cat14 — advice quality A/B.** `think --with-calibration` vs baseline on 8 hand-authored probes covering 6 calibration scenarios (relevant bias, confidence boost, empty profile, irrelevant bias, multi-bias, voice stress). First live run: **75% calibrated wins / 0% baseline wins / 25% tie**, voice gate **100%**, force-fit prevention **100%**.
+- **cat15 — propose_takes F1.** Extract-takes prompt against 48 hand-labeled claims across 8 synthetic pages covering 5 prose genres. First live run: **0.952 F1 training / 0.922 F1 holdout**, train-holdout gap **0.03** (no overfitting). The tuned prompt back-ports verbatim into this wave's `EXTRACT_TAKES_PROMPT`, replacing the v1 stub.
+
+The iteration log at `eval/data/cat14-calibration/iteration-log.md` documents three same-day prompt variants where the gate caught two regressions before either could ship. Full benchmark report: [2026-05-18 BrainBench Cat 14 + Cat 15 Calibration](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-18-brainbench-cat14-cat15-calibration.md). No prior published baseline exists in the personal-AI calibration-loop space; Hindsight introduced the concept as a skills demo without quantified evaluation. cat14 + cat15 stake out the category.
+
+Reproduction: ~$0.15 per full eval run (cat14 + cat15), under 5 minutes wallclock on Apple Silicon.
+
+### Itemized changes
+
+#### Three new cycle phases
+
+- **`propose_takes`** — LLM scans markdown prose, proposes gradeable claims to a review queue. Idempotency cache on `(source_id, page_slug, content_hash, prompt_version)` — unchanged pages never re-spend tokens. F2 fence-dedup: the LLM sees existing canonical takes and dedupes. v0.36.1.0 ships the tuned `v0.36.1.0-tuned-cat15` prompt (replaces the v1 stub) — validated at **0.922 F1 holdout** by the cat15 eval against the hand-labeled corpus at `test/fixtures/calibration/`.
+- **`grade_takes`** — walks unresolved takes older than 6 months, retrieves evidence, asks a judge model. Auto-resolve DISABLED by default (D17 — earn trust first); operator opts in via `cycle.grade_takes.auto_resolve.enabled: true`. Conservative threshold: confidence >= 0.95 single-model OR >= 0.85 with 3/3 ensemble unanimous. Ensemble tiebreaker (E2) reuses v0.27.x cross-modal-eval substrate; fires on borderline single-model verdicts (0.6-0.95 band).
+- **`calibration_profile`** — aggregates resolved takes into 2-4 narrative pattern statements + active bias tags. Voice-gated via shared `gateVoice()` (D24 — five surfaces, one function). Cold-brain branch: skips when <5 resolved takes. `grade_completion` field surfaces partial-grade state to the dashboard "60% graded" badge.
+
+#### Eight expansions
+
+- **E1** Anti-bias prompt rewrite at think time (cathedral moment — see "What you can now do").
+- **E2** Multi-judge ensemble grading (3-model parallel via Promise.allSettled, 3/3 unanimous required for auto-apply).
+- **E3** Calibration-aware contradictions — v0.32.6 probe + bias-tag join; outputs flag "this contradiction fits your over-confident-geography pattern."
+- **E4** Outcome-driven gstack-learnings coupling — incorrect auto-resolutions write to `~/.gstack/projects/<slug>/learnings.jsonl` so plan-ceo-review / ship / investigate skills pull calibration data. Config-gated (off for external users until gstack-API stabilizes).
+- **E5** Brier-trend forecasting on new takes — inline blurb at write time. Pure math over existing scorecards, no LLM.
+- **E6** Admin SPA Calibration tab with 4 server-rendered SVG charts (Brier trend, per-domain accuracy, abandoned threads, clickable pattern drill-downs).
+- **E7** Real-time pattern surfacing on sync — conversational nudges with 14-day cooldown via `take_nudge_log`.
+- **E8** Team-brain calibration sharing via mounts — asymmetric publish-opt-in (D15) + D18 cross-brain query semantics (4 rules, pinned by `test/cross-brain-calibration.test.ts`).
+
+#### Schema (6 new migrations)
+
+- v67 `calibration_profiles` — per-(source, holder) row with scorecard + narrative + bias tags + voice-gate audit.
+- v68 `take_proposals` — propose_takes queue with composite idempotency unique key.
+- v69 `take_grade_cache` — grade_takes verdict cache (composite PK on take + prompt_version + judge + evidence_signature).
+- v70 `take_nudge_log` — E7 cooldown state (polymorphic FK: take_id OR proposal_id).
+- v71 `takes_resolved_at_idx` — partial index for Brier-trend aggregation (CONCURRENTLY on Postgres, plain on PGLite).
+- v72 `think_ab_results` — D19 A/B harness data for `gbrain think --ab`.
+
+Every row carries `wave_version='v0.36.1.0'` so `--undo-wave` can reverse precisely.
+
+#### Architecture
+
+- `BaseCyclePhase` abstract class (D21) enforces source-scope threading, budget metering, error envelope, and progress-reporter integration at the type level. Forgetting `sourceScopeOpts(ctx)` becomes a compile error — closes the v0.34.1 leak class structurally for every new phase.
+- Voice gate (D11 + D24): single `gateVoice()` function, mode parameter drives surface-specific rubrics. 2 regenerations then hand-written template fallback. Audit columns persisted on `calibration_profiles` rows so the operator can spot voice-rubric drift.
+- Cross-brain query semantics (D18): 4 rules, hermetically tested. Subagent prohibition gates on `ctx.viaSubagent && !allowedSlugPrefixes` — closes the OAuth-token-to-cross-brain-leak escalation surface.
+
+#### New surfaces
+
+- CLI: `gbrain calibration`, `gbrain calibration --regenerate`, `gbrain calibration --undo-wave <version> [--dry-run] [--scrub-gstack]`, `gbrain calibration ab-report [--days N]`, `gbrain takes revisit <slug>`, `gbrain takes nudge --reset <id>`, `gbrain think --with-calibration`.
+- MCP op: `get_calibration_profile` (scope: read).
+- HTTP routes: `/admin/api/calibration/profile`, `/admin/api/calibration/charts/:type`, `/admin/api/calibration/pattern/:id`.
+- Doctor checks (4): `abandoned_threads`, `calibration_freshness`, `grade_confidence_drift` (CDX-11 mitigation), `voice_gate_health`.
+
+#### Privacy
+
+- `test/fixtures/calibration/` ships a synthetic corpus (5 representative pages across 5 genres) for extract-takes prompt tuning. Every page is anonymized per the CLAUDE.md placeholder list — no real names, no real funds, no real deals.
+- `scripts/check-synthetic-corpus-privacy.sh` (CDX-14 mitigation) is wired into `bun run verify`. Greps for explicit dollar amounts + verifies every non-essay fixture references at least one canonical placeholder. Fail-fast on accidental leakage.
+- E7 nudges route to STDERR only in v0.36.1.0; multi-channel routing (webhook, admin SPA toast) is a v0.37+ follow-up.
+
+#### Tests
+
+- 290+ new tests across 13 new test files. All hermetic (no real LLM, no PGLite contention).
+- IRON RULE regression suite in `test/regressions/v0.36.1.0-iron-rule.test.ts` pins R1-R5: think baseline unchanged, contradictions output unchanged, takes resolution flow independent of grade_takes, search/list_pages/get_page unchanged, search modes unchanged.
+
+#### Plan + review trail
+
+- `/plan-ceo-review` cleared SCOPE_EXPANSION mode with 19 decisions + 8 accepted expansions.
+- `/plan-eng-review` cleared with 9 findings + 21 implementation tasks across 5 lanes.
+- `/plan-design-review` cleared with mockup variant-B (Linear calm clarity) approved.
+- Codex outside-voice surfaced 18 findings; 5 spec bugs auto-fixed, 6 strategic tensions resolved via D17/D18/D19.
+- 30 decisions D1-D30 resolved with explicit user input. Plan persisted at `~/.claude/plans/system-instruction-you-are-working-rippling-knuth.md`.
+
+#### Design system
+
+- `DESIGN.md` at the repo root formalizes the de facto admin tokens that landed v0.26.0. Calibration target for future `/plan-design-review` and `/design-review`.
+- `--text-muted` bumped from #555 to #777 globally for WCAG AA contrast (was 4.0 — below the 4.5 floor; now ~5.5).
+
+## To take advantage of v0.36.1.0
+
+`gbrain upgrade` is all you need for the schema. Calibration data only accumulates as you use the brain.
+
+1. Run `gbrain upgrade`. Six migrations v67-v72 land.
+2. Build up resolved takes. The calibration profile needs >= 5 resolved takes before it generates anything. Resolve takes manually via `gbrain takes resolve N --quality correct|incorrect|partial` OR wait for grade_takes auto-grading (opt in via `gbrain config set cycle.grade_takes.auto_resolve.enabled true`).
+3. Run a dream cycle: `gbrain dream` (or wait for autopilot). The new phases run in this order: propose_takes → grade_takes → calibration_profile.
+4. Read the profile: `gbrain calibration`.
+5. Try anti-bias think: `gbrain think --with-calibration "<your question>"`.
+6. Open the admin SPA: `gbrain serve --http` → /admin → Calibration tab.
+7. To roll back the entire wave: `gbrain calibration --undo-wave v0.36.1.0 --dry-run` first to see what would change, then drop `--dry-run`.
+8. If anything looks wrong, file an issue: https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and which step broke.
 
 ## [0.36.0.0] - 2026-05-17
 
@@ -133,6 +241,7 @@ Major file/test surface changes:
 - Extended: `src/core/skillpack/bundle.ts` (frontmatter `sources:` validation, `enumerateScaffoldEntries`), `src/core/repo-root.ts` (`cwd_walk_up` tier)
 - New docs: `docs/guides/skillpacks-as-scaffolding.md` (model + workflow)
 - `src/core/skillpack/installer.ts` and `test/skillpack-install.test.ts` survive for now — the v0.32 `gbrain skillpack diff` informational command still uses `diffSkill` from there. Slated for deletion in v0.37 cleanup.
+
 ## [0.35.8.0] - 2026-05-17
 
 **Phantom unprefixed entity pages drain automatically on the next autopilot cycle. Your `alice.md` residue gets folded into `people/alice-example.md` with embeddings + strikethrough state preserved, no operator action needed.**
@@ -223,6 +332,7 @@ The original /plan-eng-review proposed reusing `writeFactsToFence` for the migra
    - output of `gbrain doctor`
    - contents of `~/.gbrain/audit/phantoms-*.jsonl`
    - which step looks wrong
+
 ## [0.35.7.0] - 2026-05-17
 
 **The contradiction probe grew up. Typed claims over time, regressions detected automatically, founder scorecards as a one-liner.**
