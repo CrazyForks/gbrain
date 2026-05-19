@@ -46,8 +46,11 @@ const HELP_TOP = `gbrain skillpack <subcommand> [options]
 Subcommands:
   list                       Print every skill bundled in openclaw.plugin.json.
 
-  scaffold <name>            Copy a bundled skill into your agent repo. Additive;
-  scaffold --all             refuses to overwrite existing files.
+  scaffold <name|source>     Copy a bundled skill OR a third-party skillpack
+                             into your agent repo. Additive; refuses to
+                             overwrite. Third-party sources: owner/repo,
+                             https://...git, ./local-dir, ./local.tgz.
+  scaffold --all             Scaffold every bundled skill (gbrain only).
 
   reference <name>           Read-only: diff gbrain's bundle vs your local copy.
   reference --all            Sweep over every bundled skill.
@@ -68,6 +71,18 @@ Subcommands:
 
   check                      Health report. \`check --strict\` exits non-zero
                              on any drift (for CI gating).
+
+  search [<query>]           Search the third-party registry catalog.
+  info <name>                Show full metadata for a registry entry.
+  registry [--url URL]       Show/set the configured registry URL.
+
+  doctor <pack-dir>          Run the 10-dimension quality rubric over a
+                             third-party pack. --quick (~5s), --fix to
+                             auto-scaffold missing artifacts.
+  init <name>                Scaffold a fresh skillpack tree (cathedral
+                             default; --minimal opts out of test/e2e/evals).
+  pack [<pack-dir>]          Run doctor then emit a deterministic
+                             <name>-<version>.tgz tarball with SHA-256.
 
 Run \`gbrain skillpack <subcommand> --help\` for per-subcommand options.
 
@@ -120,6 +135,12 @@ export async function runSkillpack(args: string[]): Promise<void> {
       return;
     case 'doctor':
       await cmdDoctor(rest);
+      return;
+    case 'init':
+      await cmdInit(rest);
+      return;
+    case 'pack':
+      await cmdPack(rest);
       return;
     case 'install':
       console.error(
@@ -977,6 +998,174 @@ async function cmdDoctor(args: string[]): Promise<void> {
   }
   if (result.score < 10) process.exit(1);
   process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// init — publisher scaffold
+// ---------------------------------------------------------------------------
+
+async function cmdInit(args: string[]): Promise<void> {
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(
+      'gbrain skillpack init <name> [--target PATH] [--minimal] [--author NAME] [--license SPDX] [--homepage URL] [--dry-run] [--json]\n\n' +
+        '  <name>       Pack name (lowercase kebab; becomes manifest.name + dir leaf)\n' +
+        '  --target     Target dir (default: ./<name>)\n' +
+        '  --minimal    Skip test/, e2e/, evals/ (advanced; doctor will score lower)\n' +
+        '  --dry-run    Report intent, no writes\n' +
+        '  --json       JSON envelope for agent consumption',
+    );
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  const minimal = args.includes('--minimal');
+  const dryRun = args.includes('--dry-run');
+  let name: string | undefined;
+  let target: string | undefined;
+  let author: string | undefined;
+  let license: string | undefined;
+  let homepage: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--target') {
+      target = args[i + 1];
+      i++;
+    } else if (a === '--author') {
+      author = args[i + 1];
+      i++;
+    } else if (a === '--license') {
+      license = args[i + 1];
+      i++;
+    } else if (a === '--homepage') {
+      homepage = args[i + 1];
+      i++;
+    } else if (a && !a.startsWith('--') && !name) {
+      name = a;
+    }
+  }
+  if (!name) {
+    console.error('Error: pass the new skillpack name.');
+    process.exit(2);
+  }
+
+  const { runInitScaffold, InitScaffoldError } = await import('../core/skillpack/init-scaffold.ts');
+  const targetDir = resolveAbs(target ?? `./${name}`);
+
+  try {
+    const result = runInitScaffold({
+      targetDir,
+      name,
+      minimal,
+      author,
+      license,
+      homepage,
+      dryRun,
+    });
+    if (json) {
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            dry_run: dryRun,
+            target: result.targetDir,
+            files_written: result.filesWritten,
+            files_skipped_existing: result.filesSkippedExisting,
+            manifest: result.manifest,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(
+        `${dryRun ? 'init (dry-run)' : 'init'}: ${result.filesWritten.length} files written, ${result.filesSkippedExisting.length} skipped (already existed) at ${result.targetDir}`,
+      );
+      if (result.filesSkippedExisting.length > 0 && !dryRun) {
+        console.log('\nSkipped existing files (preserved):');
+        for (const p of result.filesSkippedExisting) console.log(`  ${p}`);
+      }
+      if (!dryRun) {
+        console.log(
+          `\nNext:\n  cd ${result.targetDir}\n  gbrain skillpack doctor . --quick\n  # iterate, then:\n  gbrain skillpack pack`,
+        );
+      }
+    }
+    process.exit(0);
+  } catch (err) {
+    if (err instanceof InitScaffoldError) {
+      console.error(`skillpack init: ${err.message}`);
+      process.exit(2);
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// pack — publisher tarball emit + local validation
+// ---------------------------------------------------------------------------
+
+async function cmdPack(args: string[]): Promise<void> {
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(
+      'gbrain skillpack pack [<pack-dir>] [--out PATH] [--dry-run] [--skip-doctor] [--json]\n\n' +
+        '  <pack-dir>    Pack root (default: .)\n' +
+        '  --out PATH    Output dir for the tarball (default: <pack-dir>)\n' +
+        '  --dry-run     Validate only, no tarball\n' +
+        '  --skip-doctor Skip the doctor gate (publish-gate skill uses this)\n' +
+        '  --json        JSON envelope for agent consumption',
+    );
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  const dryRun = args.includes('--dry-run');
+  const skipDoctor = args.includes('--skip-doctor');
+  let packDir: string | undefined;
+  let outDir: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--out') {
+      outDir = args[i + 1];
+      i++;
+    } else if (a && !a.startsWith('--') && !packDir) {
+      packDir = a;
+    }
+  }
+  const packRoot = resolveAbs(packDir ?? '.');
+
+  const { runPackPublish, PackPublishError } = await import('../core/skillpack/pack-publish.ts');
+  try {
+    const result = await runPackPublish({
+      packRoot,
+      outDir: outDir ? resolveAbs(outDir) : undefined,
+      dryRun,
+      skipDoctor,
+    });
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else if (result.refused_reason) {
+      console.error(`skillpack pack: refused — ${result.refused_reason}`);
+      if (result.doctor) {
+        const blocked = result.doctor.dimensions.filter((d) => !d.passed && d.category === 'core');
+        for (const d of blocked) console.error(`  ✗ ${d.name}: ${d.detail}`);
+      }
+      console.error('\nRun `gbrain skillpack doctor . --fix --yes` to auto-scaffold what you can, then re-run.');
+      process.exit(2);
+    } else if (result.tarball) {
+      console.log(`pack: ${result.pack_name}@${result.pack_version} -> ${result.tarball.outPath}`);
+      console.log(`  SHA-256:        sha256:${result.tarball.sha256}`);
+      console.log(`  File count:     ${result.tarball.fileCount}`);
+      console.log(`  Compressed:     ${result.tarball.compressedBytes} bytes`);
+      console.log(`  Tier eligible:  ${result.tarball.tier_eligibility}`);
+    } else {
+      console.log(`pack (dry-run): ${result.pack_name}@${result.pack_version} — doctor verdict ${result.doctor?.tier_eligibility ?? '(skipped)'}`);
+    }
+    process.exit(0);
+  } catch (err) {
+    if (err instanceof PackPublishError) {
+      console.error(`skillpack pack: ${err.message}`);
+      process.exit(2);
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
