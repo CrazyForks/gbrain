@@ -26,7 +26,8 @@
  *   relaxed per-caller.
  */
 
-import type { ChatFn, ChatResult } from '../ai/gateway.ts';
+import type { ChatResult } from '../ai/gateway.ts';
+import type { ChatFn } from '../brainstorm/judges.ts';
 
 export type FitStrategy = 'batch' | 'summarize';
 

@@ -37,6 +37,28 @@ import {
 import { ANTHROPIC_PRICING } from '../anthropic-pricing.ts';
 
 // ---------------------------------------------------------------------------
+// BudgetExhausted is the canonical typed error (Q2) used by every cost
+// guardrail in the orchestrator. The class lives in
+// `src/core/budget/budget-tracker.ts` (Phase 2 of the budget cathedral); we
+// re-export here for back-compat with any caller that imports it from this
+// module (the only known caller is the test suite).
+// ---------------------------------------------------------------------------
+
+import { BudgetExhausted, BudgetTracker } from '../budget/budget-tracker.ts';
+import { withBudgetTracker } from '../ai/gateway.ts';
+import {
+  computeRunId,
+  loadCheckpoint,
+  saveCheckpoint,
+  isCheckpointFresh,
+  clearCheckpoint,
+  type BrainstormCheckpoint,
+  type CheckpointCross,
+} from './checkpoint.ts';
+
+export { BudgetExhausted };
+
+// ---------------------------------------------------------------------------
 // Profile (BrainstormProfile is the brainstorm vs LSD config object)
 // ---------------------------------------------------------------------------
 
@@ -147,25 +169,22 @@ export interface BrainstormOptions {
    * but risk context overflow; smaller batches are slower but safer.
    */
   maxIdeasPerJudgeCall?: number;
-}
-
-/**
- * Phase-1 inline BudgetExhausted. Phase 2 of the cost wave moves this to
- * `src/core/budget/budget-tracker.ts` and the orchestrator imports it. Kept
- * inline now so Phase 1 can ship without depending on Phase 2.
- */
-export class BudgetExhausted extends Error {
-  readonly tag = 'BUDGET_EXHAUSTED' as const;
-  reason: 'cost' | 'runtime' | 'no_pricing';
-  spent: number;
-  cap: number;
-  constructor(message: string, reason: 'cost' | 'runtime' | 'no_pricing', spent: number, cap: number) {
-    super(message);
-    this.name = 'BudgetExhausted';
-    this.reason = reason;
-    this.spent = spent;
-    this.cap = cap;
-  }
+  /**
+   * TX4: resume from a previously-persisted checkpoint at
+   * `~/.gbrain/brainstorm/<run_id>.json`. Set by `--resume <run_id>`.
+   * When the checkpoint's identity (run_id) doesn't match the active
+   * inputs, the orchestrator refuses with a paste-ready hint rather
+   * than silently starting fresh.
+   *
+   * If undefined and a fresh checkpoint exists for the auto-derived
+   * run_id, the orchestrator does NOT auto-resume — caller must opt in
+   * via the explicit flag.
+   */
+  resumeRunId?: string;
+  /**
+   * A5: bypass the 7-day staleness gate when --resume is set.
+   */
+  forceResume?: boolean;
 }
 
 /** One idea emitted to the user, with citation transparency (D6). */
@@ -455,6 +474,24 @@ export async function runBrainstorm(
   config: { embedding_model?: string; emotional_weight?: { user_holder?: string } },
   opts: BrainstormOptions
 ): Promise<BrainstormResult> {
+  // T10: install a gateway-layer BudgetTracker scope around the whole run
+  // so every gateway.chat / embed call (the cross generations + judge +
+  // question embed) auto-records cost via the AsyncLocalStorage from T3.
+  // The cap mirrors the orchestrator's maxCostUsd so the gateway can
+  // hard-fail via BudgetExhausted(reason:'cost') if a single under-
+  // estimated call leaks past the ceiling (TX1).
+  const _runTracker = new BudgetTracker({
+    label: `brainstorm.${opts.profile?.label ?? 'brainstorm'}`,
+    maxCostUsd: opts.maxCostUsd ?? 5,
+  });
+  return withBudgetTracker(_runTracker, () => _runBrainstormInner(engine, config, opts));
+}
+
+async function _runBrainstormInner(
+  engine: BrainEngine,
+  config: { embedding_model?: string; emotional_weight?: { user_holder?: string } },
+  opts: BrainstormOptions,
+): Promise<BrainstormResult> {
   const profile = opts.profile ?? BRAINSTORM_PROFILE;
   const stderr = opts.stderrWrite ?? ((s: string) => { process.stderr.write(s); });
   const chat = opts.chatFn ?? defaultChat;
@@ -484,7 +521,7 @@ export async function runBrainstorm(
     throw new BudgetExhausted(
       `${profile.label}: estimated cost ${fmtUsd(estimate)} exceeds --max-cost ${fmtUsd(maxCostUsd)}. ` +
       `Lower --limit, raise --max-cost, or pass --max-far-set <n> to cap the domain bank.`,
-      'cost', estimate, maxCostUsd,
+      { reason: 'cost', spent: estimate, cap: maxCostUsd },
     );
   }
 
@@ -587,11 +624,81 @@ export async function runBrainstorm(
     }
   }
 
+  // ---- TX3/TX4/A5: checkpoint + --resume wiring ----
+  //
+  // run_id is derived from the inputs (question + profile + sorted slug arrays
+  // — A5 amended, no embedding bits). When opts.resumeRunId is set we load
+  // the matching checkpoint and skip already-completed crosses; when it's
+  // unset we still WRITE a checkpoint every N successful crosses so the
+  // user has a recovery path on a future crash.
+  const closeSlugsAll = closesForCross.map((c) => c.slug);
+  const farSlugsAll = farResult.pages.map((p) => p.slug);
+  const runId = computeRunId(opts.question, profile.label, closeSlugsAll, farSlugsAll);
+  const crossKey = (cross: Cross): string => `${cross.close.slug}__${cross.far.slug}`;
+  const completedFromDisk = new Map<string, CheckpointCross>(); // crossKey → ideas-from-disk
+
+  let prevCheckpoint: BrainstormCheckpoint | null = null;
+  if (opts.resumeRunId) {
+    if (opts.resumeRunId !== runId) {
+      throw new Error(
+        `${profile.label}: --resume run_id=${opts.resumeRunId} does not match inputs (active run_id=${runId}). ` +
+          `Inputs (question, close set, far set) changed since the checkpoint. Run without --resume to start fresh.`,
+      );
+    }
+    if (!opts.forceResume && !isCheckpointFresh(opts.resumeRunId)) {
+      throw new Error(
+        `${profile.label}: checkpoint ${opts.resumeRunId} is older than 7 days. ` +
+          `Pass --force-resume to override, or run without --resume to start fresh.`,
+      );
+    }
+    prevCheckpoint = loadCheckpoint(opts.resumeRunId);
+    if (!prevCheckpoint) {
+      throw new Error(
+        `${profile.label}: --resume ${opts.resumeRunId}: no checkpoint found or schema mismatch. ` +
+          `Run without --resume to start fresh.`,
+      );
+    }
+    for (const cc of prevCheckpoint.completed_crosses) {
+      completedFromDisk.set(`${cc.close_slug}__${cc.far_slug}`, cc);
+    }
+    stderr(`[${profile.label}] resuming run ${runId}: ${completedFromDisk.size}/${crosses.length} crosses already done\n`);
+  }
+
+  // Live checkpoint state — appended to as crosses succeed/fail; flushed
+  // every 5 crosses.
+  const liveCheckpoint: BrainstormCheckpoint = {
+    schema_version: 2,
+    run_id: runId,
+    question: opts.question,
+    profile_label: profile.label,
+    started_at: prevCheckpoint?.started_at ?? new Date().toISOString(),
+    completed_crosses: prevCheckpoint?.completed_crosses.slice() ?? [],
+    failed_crosses: prevCheckpoint?.failed_crosses.slice() ?? [],
+    judge_done: false,
+  };
+  let crossesSinceFlush = 0;
+  const flush = (): void => {
+    saveCheckpoint(liveCheckpoint);
+    crossesSinceFlush = 0;
+  };
+
   let totalUsage = { input_tokens: 0, output_tokens: 0 };
   let crossModel = modelStr;
 
   // Parallelize chat calls bounded at DEFAULT_PARALLELISM.
   const rawIdeasByCross = await mapWithConcurrency(crosses, DEFAULT_PARALLELISM, async (cross) => {
+    // Skip crosses already completed in a prior run (TX4 single-rule).
+    const key = crossKey(cross);
+    if (completedFromDisk.has(key)) {
+      const fromDisk = completedFromDisk.get(key)!;
+      return fromDisk.ideas.map((idea) => ({
+        text: idea.text,
+        close_slug: cross.close.slug,
+        far_slug: cross.far.slug,
+        distance_score: cross.far.distance_score,
+      }));
+    }
+
     const { system, user } = buildCrossPrompt({
       profile,
       question: opts.question,
@@ -619,17 +726,29 @@ export async function runBrainstorm(
       if (runningUsd > maxCostUsd) {
         throw new BudgetExhausted(
           `${profile.label}: running cost ${fmtUsd(runningUsd)} exceeded --max-cost ${fmtUsd(maxCostUsd)} mid-run; aborting remaining crosses`,
-          'cost', runningUsd, maxCostUsd,
+          { reason: 'cost', spent: runningUsd, cap: maxCostUsd },
         );
       }
       if (opts.strictBudget === true && runningUsd > estimate * 5) {
         throw new BudgetExhausted(
           `${profile.label}: running cost ${fmtUsd(runningUsd)} exceeded 5× estimate (${fmtUsd(estimate)}) under --strict-budget`,
-          'cost', runningUsd, estimate * 5,
+          { reason: 'cost', spent: runningUsd, cap: estimate * 5 },
         );
       }
       const parsed = parseIdeaResponse(result.text);
-      return parsed.slice(0, profile.ideas_per_cross).map((text) => ({
+      const sliced = parsed.slice(0, profile.ideas_per_cross);
+      // TX3: persist FULL idea bodies, not just counts. Resume reconstructs
+      // the BrainstormResult by reading these back from disk.
+      const crossId = `${cross.close.slug}__${cross.far.slug}`;
+      liveCheckpoint.completed_crosses.push({
+        close_slug: cross.close.slug,
+        far_slug: cross.far.slug,
+        cross_id: crossId,
+        ideas: sliced.map((text) => ({ text, cross_id: crossId })),
+      });
+      crossesSinceFlush++;
+      if (crossesSinceFlush >= 5) flush();
+      return sliced.map((text) => ({
         text,
         close_slug: cross.close.slug,
         far_slug: cross.far.slug,
@@ -641,13 +760,25 @@ export async function runBrainstorm(
       // per-cross errors are warned + swallowed so one bad cross doesn't
       // void the rest of the run.
       if (err instanceof BudgetExhausted) {
+        // Flush checkpoint before propagating so any completed crosses
+        // are persisted for --resume.
+        flush();
         throw err;
       }
       const msg = err instanceof Error ? err.message : String(err);
       stderr(`[${profile.label}] WARN: cross [${cross.close.slug}] × [${cross.far.slug}] failed: ${msg}\n`);
+      liveCheckpoint.failed_crosses.push({
+        close_slug: cross.close.slug,
+        far_slug: cross.far.slug,
+        error: msg,
+      });
+      crossesSinceFlush++;
+      if (crossesSinceFlush >= 5) flush();
       return [];
     }
   });
+  // Final flush so the on-disk file reflects the post-loop state.
+  flush();
 
   // Flatten + assign stable ids.
   const allRawIdeas: Array<{ id: string; text: string; close_slug: string; far_slug: string; distance_score: number }> = [];
@@ -717,6 +848,21 @@ export async function runBrainstorm(
   const pricing = ANTHROPIC_PRICING[crossModel] ?? { input: 3, output: 15 };
   const actual = (totalIn / 1_000_000) * pricing.input + (totalOut / 1_000_000) * pricing.output;
   stderr(`[${profile.label}] actual cost: ${fmtUsd(actual)} (estimated ${fmtUsd(estimate)}) — in=${totalIn} out=${totalOut} tokens\n`);
+
+  // TX4: surface --resume hint when any cross failed during this run.
+  // The user can re-run with `--resume <run_id>` and we'll retry only
+  // the missing crosses (failed_crosses + never-attempted).
+  if (liveCheckpoint.failed_crosses.length > 0) {
+    stderr(
+      `[${profile.label}] ${liveCheckpoint.failed_crosses.length} cross(es) failed. Resume with: gbrain ${profile.label} --resume ${runId}\n`,
+    );
+  } else {
+    // Clean completion — every cross succeeded. Clear the checkpoint so we
+    // don't accumulate noise + so a stale run_id doesn't auto-resume.
+    liveCheckpoint.judge_done = true;
+    saveCheckpoint(liveCheckpoint);
+    clearCheckpoint(runId);
+  }
 
   return {
     profile_label: profile.label,

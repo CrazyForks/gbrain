@@ -978,13 +978,25 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
     } catch {
       // Non-fatal: op_checkpoints table may not exist yet on pre-v67 brains.
     }
+    // v0.37.x — TX3 / A5: GC stale brainstorm checkpoints (filesystem-side).
+    // 7-day mtime window mirrors op_checkpoints. Wrapped in try/catch
+    // because the brainstorm dir may not exist on a brain that's never
+    // run a brainstorm.
+    let purgedBrainstormCheckpoints = 0;
+    try {
+      const { gcStaleCheckpoints } = await import('./brainstorm/checkpoint.ts');
+      purgedBrainstormCheckpoints = gcStaleCheckpoints(7);
+    } catch {
+      // Non-fatal.
+    }
     return {
       phase: 'purge',
       status: 'ok',
       duration_ms: 0,
       summary:
         `purged ${purgedSources.length} source(s), ${purgedPages.count} page(s), ` +
-        `${purgedClones.count} orphan clone temp dir(s), and ${purgedCheckpoints} stale op_checkpoint(s)`,
+        `${purgedClones.count} orphan clone temp dir(s), ${purgedCheckpoints} stale op_checkpoint(s), ` +
+        `and ${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s)`,
       details: {
         purged_sources_count: purgedSources.length,
         purged_pages_count: purgedPages.count,
@@ -993,6 +1005,7 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         purged_sources: purgedSources,
         purged_page_slugs: purgedPages.slugs,
         purged_checkpoints_count: purgedCheckpoints,
+        purged_brainstorm_checkpoints_count: purgedBrainstormCheckpoints,
       },
     };
   } catch (e) {

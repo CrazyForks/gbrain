@@ -39,6 +39,12 @@ export interface BrainstormCliArgs {
   judgeModel?: string;
   /** Max ideas per judge LLM call. Default 100. */
   maxIdeasPerJudgeCall?: number;
+  /** TX4: resume a crashed run by run_id. */
+  resume?: string;
+  /** Bypass the 7-day staleness gate on resume. */
+  forceResume?: boolean;
+  /** When true, print the list of saved runs + exit. */
+  listRuns?: boolean;
   help: boolean;
   error?: string;
 }
@@ -100,6 +106,17 @@ export function parseBrainstormArgs(args: string[]): BrainstormCliArgs {
         return out;
       }
       out.maxIdeasPerJudgeCall = n;
+    } else if (arg === '--resume') {
+      const v = args[++i];
+      if (!v || v.startsWith('--')) {
+        out.error = `--resume requires a run_id (use --list-runs to see saved runs)`;
+        return out;
+      }
+      out.resume = v;
+    } else if (arg === '--force-resume') {
+      out.forceResume = true;
+    } else if (arg === '--list-runs') {
+      out.listRuns = true;
     } else if (arg.startsWith('--')) {
       out.error = `unknown flag: ${arg}`;
       return out;
@@ -132,6 +149,9 @@ Options:
   --strict-budget                 Abort if running cost exceeds 5× the estimate
   --judge-model MODEL             Override the judge LLM (larger-context for big runs)
   --max-ideas-per-judge-call N    Max ideas per judge LLM call (default 100)
+  --resume RUN_ID                 Resume a previously-crashed run (uses --list-runs ids)
+  --force-resume                  Bypass the 7-day staleness gate on --resume
+  --list-runs                     Print saved run_ids and exit
   --help, -h                      Show this help
 
 Examples:
@@ -164,6 +184,9 @@ Options:
   --strict-budget                 Abort if running cost exceeds 5× the estimate
   --judge-model MODEL             Override the judge LLM (larger-context for big runs)
   --max-ideas-per-judge-call N    Max ideas per judge LLM call (default 100)
+  --resume RUN_ID                 Resume a previously-crashed run (uses --list-runs ids)
+  --force-resume                  Bypass the 7-day staleness gate on --resume
+  --list-runs                     Print saved run_ids and exit
   --help, -h                      Show this help
 
 Examples:
@@ -193,6 +216,24 @@ async function runBrainstormCli(
     process.exit(2);
     return;
   }
+  if (parsed.listRuns) {
+    const { listRuns } = await import('../core/brainstorm/checkpoint.ts');
+    const runs = listRuns();
+    if (parsed.json) {
+      console.log(JSON.stringify(runs, null, 2));
+    } else if (runs.length === 0) {
+      console.log('No saved brainstorm runs.');
+    } else {
+      console.log('Saved runs (newest first):');
+      console.log('run_id            | iso_date                  | question');
+      console.log('------------------+---------------------------+----------------');
+      for (const r of runs) {
+        const iso = new Date(r.mtime).toISOString();
+        console.log(`${r.run_id} | ${iso} | ${r.question.slice(0, 60)}`);
+      }
+    }
+    return;
+  }
   if (!parsed.question || parsed.question.trim().length === 0) {
     console.error(`gbrain ${profile.label}: question required`);
     console.error(help);
@@ -218,6 +259,8 @@ async function runBrainstormCli(
     strictBudget: parsed.strictBudget,
     judgeModel: parsed.judgeModel,
     maxIdeasPerJudgeCall: parsed.maxIdeasPerJudgeCall,
+    resumeRunId: parsed.resume,
+    forceResume: parsed.forceResume,
   });
 
   if (parsed.json) {
