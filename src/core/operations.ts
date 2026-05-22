@@ -1426,6 +1426,12 @@ const think: Operation = {
     // Codex P1 #7 + privacy: remote callers cannot persist via MCP.
     const safeSave = remote ? false : Boolean(p.save);
     const safeTake = remote ? false : Boolean(p.take);
+    // v0.40.2.0: thread source-scope scalars + remote flag for trajectory
+    // injection. `sourceScopeOpts(ctx)` returns the federated array (when
+    // present) OR the scalar; we pass both through to runThink which
+    // forwards to findTrajectory. CLI callers don't go through this op
+    // and get default scope + remote=false from runThink's CLI path.
+    const scope = sourceScopeOpts(ctx);
     const { runThink, persistSynthesis } = await import('./think/index.ts');
     const result = await runThink(ctx.engine, {
       question: String(p.question),
@@ -1437,6 +1443,9 @@ const think: Operation = {
       since: p.since ? String(p.since) : undefined,
       until: p.until ? String(p.until) : undefined,
       takesHoldersAllowList: ctx.takesHoldersAllowList,
+      ...(scope.sourceId !== undefined ? { sourceId: scope.sourceId } : {}),
+      ...(scope.sourceIds !== undefined ? { allowedSources: scope.sourceIds } : {}),
+      remote: ctx.remote === true,
     });
 
     // Persist if --save was passed locally
