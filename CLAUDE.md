@@ -552,6 +552,37 @@ Key files:
   (operations.ts:1103-1135 trust-boundary gate); thin-client `think` warns
   loudly when those flags are set.
 
+## Schema Cathedral v3 (v0.40.7.0)
+
+The schema-pack mutation surface shipped in v0.40.7.0 as the production rebuild of
+closed community PR #1321 (`@garrytan-agents`). Six new foundation modules + a
+mutate skeleton + stats/sync data plane + 14 CLI verbs + 9 MCP ops + a first-class
+agent skill. See `~/.claude/plans/system-instruction-you-are-working-recursive-thacker.md`
+for the full plan + 21 captured design decisions.
+
+Key files (v0.40.7.0 additions):
+- `src/core/schema-pack/pack-lock.ts` — Atomic `O_CREAT|O_EXCL` per-pack lock. DELIBERATELY NOT the `existsSync + writeFileSync` TOCTOU shape from `src/core/page-lock.ts` (codex C8 caught the bug class). Default 60s TTL, refresh every 10s while `withPackLock(fn)` runs, `--force` semantics = "steal stale lock" NOT "skip locking." Lock path per-pack so two packs never block each other.
+- `src/core/schema-pack/mutate-audit.ts` — ISO-week JSONL at `~/.gbrain/audit/schema-mutations-YYYY-Www.jsonl`. Privacy-redacted per D20: type names → sha8, prefixes → first slug segment only, matches `candidate-audit.ts` privacy posture. Logs BOTH success AND failure events so the v0.40.7+ `schema_pack_writability` doctor check has signal to read. `summarizeMutations()` is the cross-surface parity primitive.
+- `src/core/schema-pack/registry.ts` extensions — `invalidatePackCache(name?)` walks the extends-chain reverse-graph (codex C6 fix; pre-v0.40.7, editing a parent pack silently left children stale). `tryCachedPack(name)` TTL-gated fast path: inside `STAT_TTL_MS` (default 1000ms, env `GBRAIN_PACK_STAT_TTL_MS`) returns cached without statting. Outside the window: stats every file in the chain; cascade-invalidates on mtime change (D11 cross-process detection).
+- `src/core/schema-pack/best-effort.ts` — `loadActivePackBestEffort(ctx)` returns `ResolvedPack | null`. Single source of truth for the T1.5 wiring sites. `null` means EMPTY FILTER (NOT hardcoded defaults — D4 contract closing the silent-violation bug class).
+- `src/core/schema-pack/lint-rules.ts` — 11 pure rule functions. `withMutation`'s pre-write validation gate composes the 9 file-plane rules; the 2 DB-aware rules (`extractable_empty_corpus`, `mutation_count_anomaly`) need an engine. Single source of truth consumed by CLI lint + MCP `schema_lint` + the pre-write validation gate.
+- `src/core/schema-pack/query-cache-invalidator.ts` — `invalidateQueryCache(engine, sourceId?)` DELETEs query_cache rows so cached search results bound to old page types don't survive a schema mutation. Codex C9 fix.
+- `src/core/schema-pack/mutate.ts` — 8-step `withMutation` skeleton (bundled-guard → lock → read → mutator → validate → atomic write → audit → invalidate). 11 mutation primitives: `addTypeToPack`, `removeTypeFromPack` (with codex C14 reference check), `updateTypeOnPack`, `addAliasToType`, `removeAliasFromType`, `addPrefixToType`, `removePrefixFromType`, `addLinkTypeToPack`, `removeLinkTypeFromPack`, `setExtractableOnType`, `setExpertRoutingOnType`. Atomic write via `.tmp + fsync + rename` — pack file on disk is NEVER partial. Inline minimal JSON→YAML emitter so YAML packs stay YAML (does NOT preserve comments — pin pack.json if you care about layout).
+- `src/core/schema-pack/stats.ts` — `runStatsCore(engine, opts)` returns per-source + aggregate page counts + coverage % + `dead_prefixes` (declared prefixes with zero matching pages — agent's drilldown signal). Multi-source aware (`sourceIds[]` federated, `sourceId` single, or whole-brain). PGLite + Postgres parity via `executeRaw`. Empty brain → coverage:1.0 (vacuous truth).
+- `src/core/schema-pack/sync.ts` — `runSyncCore(engine, opts)` chunked UPDATE in 1000-row batches per declared prefix (D14). Concurrent writers never block on a single row >100ms. Codex C5 write-side scoping via `ctx.sourceId` directly (NOT `sourceScopeOpts` which inherits OAuth read federation). Idempotent on `--apply` re-run.
+- `src/commands/schema.ts` extension — 14 new CLI verbs in the dispatch table: `add-type`, `remove-type`, `update-type`, `add-alias`, `remove-alias`, `add-prefix`, `remove-prefix`, `add-link-type`, `remove-link-type`, `set-extractable`, `set-expert-routing`, `stats`, `sync`, `reload`. `withConnectedEngine` defensive fix from closed PR #1321 retained. Lifecycle-grouped help text (Inspection / Activation / Authoring / Discovery+repair).
+- `src/core/operations.ts` extension — 9 new MCP ops: `get_active_schema_pack`, `list_schema_packs`, `schema_stats`, `schema_lint`, `schema_graph`, `schema_explain_type`, `schema_review_orphans` (all read-scope, NOT localOnly), plus `schema_apply_mutations` (**admin scope, NOT localOnly per D2** so remote agents like your OpenClaw can author packs over HTTPS MCP — batched per D10, one MCP tool taking an `mutations[]` array atomically inside ONE `withPackLock`, audit log captures `actor: mcp:<clientId8>`) and `reload_schema_pack` (admin, NOT localOnly). Trust posture: per-call `schema_pack` opt STAYS rejected for remote callers via `op-trust-gate.ts` (R2 regression preserved).
+- `src/commands/whoknows.ts` + `src/core/operations.ts:find_experts` — T1.5 wiring sites. Pack-aware via `expertTypesFromPack(pack.manifest)` from `best-effort.ts`. Pack-load failure → EMPTY filter (NOT hardcoded `['person', 'company']` defaults per D4). A `researcher` type declared `--expert` now surfaces in `whoknows` results; pre-v0.40.7 it silently never matched.
+- `skills/schema-author/SKILL.md` — Agent dispatcher for "evolve the schema pack." Triggers: 15+ phrasings including "add a page type", "my brain has untyped pages", "propose new types from my corpus", "backfill page types". Explicit Non-goals callout to `brain-taxonomist` (files one page) and `eiirp` (schema-check during iteration) so agents pick the right surface. 7-phase workflow: brain → assess → propose → apply → sync → verify → commit. Lists every gbrain schema CLI verb + every MCP op the skill uses. `brain_first: exempt` frontmatter. Required v0.40.7+ conformance sections: Contract, Anti-Patterns, Output Format.
+- `skills/conventions/schema-evolution.md` — Canonical convention: "when to add a type vs alias vs prefix." Decision tree: <20 pages → don't pack-codify; 20-100 → alias or narrow prefix on existing type; 100+ → first-class type. Don'ts section + "when to remove a type" + "when to commit the pack" all answered in one place.
+- `skills/RESOLVER.md` + `skills/manifest.json` — schema-author wired into the dispatcher with full functional-area trigger list (compressed routing pattern per v0.32.3 dispatcher convention).
+
+T1.5 wiring is partial in v0.40.7.0. Three follow-ups filed in TODOS.md under
+"v0.40.7.0 Schema Cathedral v3 follow-ups (v0.40.7+)" — enrichment-service.ts
+union widening (`'person' | 'company'` → `string`), facts/eligibility.ts
+pack-aware `ELIGIBLE_TYPES` wiring, and 3 doctor checks (schema_pack_coverage,
+schema_pack_writability, schema_pack_mutation_audit).
+
 ## Commands
 
 Run `gbrain --help` or `gbrain --tools-json` for full command reference.
