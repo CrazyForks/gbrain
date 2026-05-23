@@ -1,5 +1,46 @@
 # TODOS
 
+## v0.40.1.0 Track D follow-ups (v0.41+)
+
+- [ ] **v0.41+: contributor-mode CI capture for BrainBench-Real replay gate.**
+  v0.40.1.0 Track D shipped the hermetic qrels gate (`test/eval-replay-gate.test.ts`)
+  as the structurally-correct replacement for the original "replay against captured
+  `eval_candidates` baseline" design. Codex outside-voice audit caught three fatal
+  flaws with the replay-against-captured-baseline approach: (a) `scripts/select-e2e.ts`
+  is local-only — `.github/workflows/test.yml` + `e2e.yml` hit fixed file lists,
+  so a diff-aware selector entry would gate nothing on GitHub PRs;
+  (b) `gbrain eval export` reads `eval_candidates` rows which only populate when
+  ops fire through the operation layer with `GBRAIN_CONTRIBUTOR_MODE=1` capture —
+  PGLite tests seeded via direct `engine.put*()` produce zero captured rows;
+  (c) `gbrain eval replay` re-embeds query text via `gateway.embedQuery()` which
+  needs an API key CI doesn't have. Real-query dogfooding is still valuable —
+  synthetic qrels test the structural ranking, real captures test what users
+  actually search for. To restore the replay-based gate properly: (1) provision
+  a CI secret for an embedding key (OpenAI text-embedding-3-small is the
+  cheapest); (2) build a nightly capture pipeline that runs
+  `GBRAIN_CONTRIBUTOR_MODE=1 gbrain eval export --tool query` against a seeded
+  brain corpus; (3) commit-automate the resulting NDJSON into
+  `test/fixtures/eval-baselines/` with a "Why:" justification line; (4) write
+  a new gate test that calls `gbrain eval replay --against <fixture>` and asserts
+  on `mean_jaccard`, `top1_stability_rate`, drops the latency assert (CI runners
+  vary too much). Estimate: ~2 weeks. Filed during v0.40.1.0 Track D
+  /plan-eng-review (see `~/.claude/plans/system-instruction-you-are-working-whimsical-acorn.md`).
+
+- [ ] **v0.41+: Wire the nightly quality probe into autopilot scheduling.**
+  v0.40.1.0 Track D shipped the phase (`src/core/cycle/nightly-quality-probe.ts`),
+  the audit JSONL (`src/core/audit-quality-probe.ts`), the doctor check
+  (`nightly_quality_probe_health` in doctor.ts), and the 10-question
+  placeholder fixture. What's NOT yet wired: `src/commands/autopilot.ts`
+  doesn't yet invoke `runNightlyQualityProbe(deps)` on its 24h cadence —
+  the phase is callable in isolation (good for testing) but no scheduled
+  loop calls it. To finish: add a phase trigger to the autopilot cycle loop
+  that calls the probe with concrete deps wiring (`isEnabled`,
+  `hasEmbeddingProvider`, `resolveMaxUsd`, `resolveRepoRoot`, real
+  `runLongMemEval` / `runCrossModalBatch` invocations via subprocess or
+  direct function call). Honor `autopilot.nightly_quality_probe.enabled`
+  config gate (already in doctor's read-side; needs autopilot read-side).
+  Doctor surface is already in place to show outcomes; just need the
+  scheduling lane. Estimate: ~3 hours.
 
 ## v0.39.3.0 smoke-test wave — deferred follow-ups (v0.39.4 / v0.40)
 

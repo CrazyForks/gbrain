@@ -75,6 +75,130 @@ Plan file at `~/.claude/plans/system-instruction-you-are-working-crystalline-owl
 
 
 
+## [0.40.1.0] - 2026-05-22
+
+**Eval infrastructure that catches retrieval regressions before merge and proves answer-quality wins after ship.**
+
+Three things changed about how gbrain measures itself. First, when you run the LongMemEval benchmark, you can now see per-question-type recall in machine-readable form (a single flag prints something like "single-session-user: 94.7%, multi-session: 100%"). Before this release that number existed but only as a fleeting stderr line — you couldn't pipe it into a script or compare it across runs. Second, any PR that touches the search code now runs a tiny hermetic test that asks "would this change rerank our known queries?" Twelve hand-curated queries with known expected results live in a fixture; the test runs them through the new ranking and fails the PR if the top-1 match rate drops below 80% or recall@10 drops below 85%. No API keys, no Postgres, no flakiness — just `bun test` in the standard PR shard. Third, you can run cross-modal quality scoring across a whole LongMemEval slice in one command (`gbrain eval cross-modal --batch run.jsonl --limit 10 --cycles 1`) with built-in cost guardrails so you can't accidentally spend $50 on a quality check.
+
+The headline number for the user: agents that touch retrieval can now ship knowing whether they regressed real query-answer quality, not just whether tests pass.
+
+### How to turn it on
+
+```bash
+# 1. Per-question-type breakdown after any LongMemEval run.
+gbrain eval longmemeval ~/datasets/longmemeval_s.jsonl \
+  --by-type --output /tmp/run.jsonl
+tail -1 /tmp/run.jsonl | jq .   # summary line with recall_by_type
+
+# 2. The qrels gate runs automatically on every PR touching src/core/search/**.
+#    No setup needed. To run locally:
+bun test test/eval-replay-gate.test.ts
+
+# 3. Cross-modal batch over LongMemEval output (real LLM cost ~$0.70 default).
+gbrain eval cross-modal --batch /tmp/run.jsonl \
+  --limit 10 --cycles 1 --concurrent 3 --max-usd 5 --json
+
+# 4. Opt-in nightly quality probe via autopilot (scheduler wiring deferred to
+#    v0.41+; phase is callable in isolation today).
+gbrain config set autopilot.nightly_quality_probe.enabled true
+```
+
+### Numbers that matter
+
+| Surface | Before | After |
+|---|---|---|
+| Per-question-type R@k | stderr-only, lost on next run | JSONL summary line, scriptable, resume-safe |
+| Search PR gate | none (silent regressions possible) | hermetic qrels gate on every PR shard |
+| Cross-modal batch | single-task only; manual loop needed | `--batch FILE` with semaphore + cost cap |
+| Default batch cost ceiling | implied | `--max-usd 5` refuses without `--yes` |
+| Nightly quality probe | not present | opt-in autopilot phase + doctor check + audit JSONL |
+
+### Things to watch after upgrade
+
+- `gbrain doctor` will now show `nightly_quality_probe_health: disabled (opt-in)` until you set the config flag. This is informational, not a warning.
+- The LongMemEval `--by-type` summary is appended as a NEW JSON line at the end of the output. Existing consumers (LongMemEval's `evaluate_qa.py`) ignore unknown fields, so your existing pipelines keep working unchanged.
+- The qrels gate uses synthetic queries with placeholder names (alice-example, widget-co-example, etc.). When a real ranking change moves expected slugs, you refresh `test/fixtures/eval-baselines/qrels-search.json` and add a `Why:` line to the commit body so future maintainers understand the drift.
+- Autopilot scheduler wiring for the nightly probe is deferred to v0.41+ — the phase is callable in isolation today via the DI surface; cycle-loop dispatcher integration is filed as a follow-up TODO.
+
+### Itemized changes
+
+#### `gbrain eval longmemeval --by-type`
+
+- Every per-question JSONL row now includes `question: string`, `question_type: string`, and (when ground truth is available) `recall_hit: boolean`. Additive — `evaluate_qa.py` and other consumers ignore unknown fields.
+- New `--by-type` flag emits a final `{schema_version:1, kind:"by_type_summary", recall_by_type:{...}, aggregate:{...}}` line as the LAST line of the output.
+- Resume-safe via three new exported helpers (`buildByTypeSummary`, `emitByTypeSummary`, `seedRecallByTypeFromFile`): the summary is rebuilt from existing file rows on `--resume-from` runs so the final aggregate covers ALL resumed questions, and any prior summary at the tail is replaced rather than appended.
+- New `--by-type-floor F` (range [0,1]) exits non-zero with a per-type breach stderr line when any `question_type` rate falls below floor. Default unset = informational only.
+- Empty-bucket guard: `aggregate.rate` is `null` (not NaN) when no questions had ground truth, so downstream JSON consumers don't trip.
+- Pinned by 5 new cases in `test/eval-longmemeval.test.ts` covering question-field presence, with/without flag emission, resume-replace at file tail with cumulative aggregation across runs, and the pure `buildByTypeSummary` function.
+
+#### Hermetic qrels retrieval gate
+
+- New committed fixture at `test/fixtures/eval-baselines/qrels-search.json` with 12 hand-curated queries using placeholder names only.
+- New unit test at `test/eval-replay-gate.test.ts` (NOT under `test/e2e/` — the unit-shard CI matrix runs every PR via `bun test`; `test/e2e/` is fixed-file). Uses the canonical PGLite block from CLAUDE.md test-isolation rules and basis-vector embeddings (the `basisEmbedding(idx)` pattern from `test/e2e/search-quality.test.ts:23-28`) so retrieval is hermetic — no API keys, no `DATABASE_URL`, fully deterministic.
+- For each query, asserts `top1_match_rate >= 0.80` AND `recall_at_10 >= 0.85`. Env-overridable floors via `GBRAIN_REPLAY_GATE_TOP1_FLOOR` / `GBRAIN_REPLAY_GATE_RECALL_FLOOR`.
+- When the gate trips, the test surfaces per-query results to stderr (HIT/miss + recall) so the operator sees exactly which queries regressed without re-running.
+- Pinned by 5 cases including a privacy-grep regression guard that fails on any real-name reintroduction.
+
+#### `gbrain eval cross-modal --batch`
+
+- Existing single-task `gbrain eval cross-modal` grows new flags: `--batch <jsonl> [--limit N] [--concurrent N] [--max-usd FLOAT] [--yes]`. Mutually exclusive with `--task` (fail-fast usage error). One canonical home for cross-modal eval — no new subcommand.
+- Reads LongMemEval-shape JSONL output, filters `kind: "by_type_summary"` rows automatically, slices to `--limit` (default 10), and fans out via semaphore-bounded loop.
+- New inline `runWithLimit<T>(items, limit, fn)` semaphore primitive (exported for unit tests): default `--concurrent 3` × 3 model slots per question = max 9 simultaneous API calls. Below tier-1 rate limits on Anthropic, OpenAI, and Google.
+- Pre-flight cost estimate refuses if `> --max-usd` (default 5.00 USD) without `--yes`. Cron / CI callers must pass `--yes` explicitly to bypass.
+- Per-question receipts land in a per-batch tempdir and are deleted at end of run so `~/.gbrain/eval-receipts/` doesn't accumulate junk. The summary receipt inlines per-question verdicts as JSON, not file paths, so the audit trail is self-contained.
+- Exit precedence (fail-loud convention; new batch-level policy, NOT inherited from `aggregate.ts`): ERROR > FAIL > INCONCLUSIVE > PASS. Any per-question runtime error → exit 2 even if other questions passed.
+- New `runEvalCrossModal(args, opts?: {runEval?: typeof runEval})` DI seam mirrors the eval-longmemeval pattern. Tests pass a stub `runEval` returning deterministic `RunEvalResult`; gateway availability check is also skipped when `opts.runEval` is provided so unit tests don't need API keys.
+- Pinned by 17 cases in `test/eval-cross-modal-batch.test.ts` (semaphore unit tests + batch flow + exit precedence + privacy filter + mutex + budget refuse + by-type-summary filter + parser strictness).
+
+#### Nightly quality probe (opt-in)
+
+- New autopilot phase at `src/core/cycle/nightly-quality-probe.ts` that composes `eval longmemeval` + `eval cross-modal --batch` into a 24h-cadenced quality check.
+- New audit JSONL writer at `src/core/audit-quality-probe.ts` writing to `~/.gbrain/audit/quality-probe-YYYY-Www.jsonl` (ISO-week rotation; mirrors `audit-slug-fallback.ts`; honors `GBRAIN_AUDIT_DIR`). One event per run with outcome, exit code, pass/fail/inconclusive/error counts, est_cost_usd, fixture_sha8, and optional detail.
+- Pure `shouldRunNightly(now, recentEvents, windowMs?)` function gates the 24h rate limit so the audit-log read is the only state and tests can drive any cadence.
+- Full DI surface via `NightlyProbeDeps` (`isEnabled`, `hasEmbeddingProvider`, `resolveMaxUsd`, `resolveRepoRoot`, `runLongMemEval`, `runCrossModalBatch`, `now`). Tests stub every external effect — no PGLite, no real LLM calls, no env mutation outside `withEnv()`.
+- New 10-question placeholder fixture at `test/fixtures/longmemeval-nightly.jsonl` using only synthetic names. Distinct from the existing 5-question `longmemeval-mini.jsonl` (unit-test fixture) so the nightly probe has consistent regression signal.
+- New `nightly_quality_probe_health` check in `gbrain doctor`: SKIPPED with paste-ready enable command when disabled; OK with timestamp when all PASS in last 7 days; WARN with per-outcome counts when any FAIL / ERROR / BUDGET_EXCEEDED. The check is also exposed as the pure `computeNightlyQualityProbeHealthCheck(probeEnabled, events)` helper for direct unit testing.
+- Default DISABLED — opt-in via `gbrain config set autopilot.nightly_quality_probe.enabled true`. New users running `gbrain init` should NOT discover background API spend.
+- Real expected cost: ~$0.35/night ≈ $10.50/month. Worst-case under the default $5 cap: $150/month.
+- Pinned by 21 cases in `test/nightly-quality-probe.test.ts` covering the rate-limit pure function, every outcome branch (disabled / no-embedding-key / rate-limited / pass / fail / runtime-error / missing-fixture), and all 7 branches of the doctor check.
+- Autopilot scheduler wiring deferred to v0.41+ — the phase is callable in isolation today; cycle-loop dispatcher integration filed in TODOS.md as a ~3-hour follow-up.
+
+#### For contributors
+
+- DI seam consistency: `runEvalCrossModal(args, opts?)` now mirrors `runEvalLongMemEval(args, opts?)`. Both let tests stub the heavy backend without `mock.module` (which would force `*.serial.test.ts` quarantine under the test-isolation rules).
+- Cost-bounding pattern: every new long-running command in this wave (--batch, nightly probe) refuses to start past a configurable USD cap without explicit `--yes`. Consistent across the surface.
+
+## To take advantage of v0.40.1.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Your agent reads the docs the next time you interact with it.** No schema migration in this release — Track D is pure tooling. CLAUDE.md's "Key files" section grew four annotations; `bun run build:llms` regenerated `llms.txt` + `llms-full.txt` in the same commit.
+3. **Verify the outcome:**
+   ```bash
+   bun test test/eval-replay-gate.test.ts        # hermetic qrels gate green
+   bun test test/eval-longmemeval.test.ts        # --by-type cases green
+   bun test test/eval-cross-modal-batch.test.ts  # --batch cases green
+   bun test test/nightly-quality-probe.test.ts   # nightly probe DI cases green
+   gbrain doctor --json | jq '.checks.nightly_quality_probe_health'
+   ```
+4. **Optionally enable the nightly probe** (real API cost ~$10.50/month expected, $150/month worst-case under the default $5/run cap):
+   ```bash
+   gbrain config set autopilot.nightly_quality_probe.enabled true
+   ```
+   Skip if you don't want background API spend.
+5. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
 ## [0.40.0.0] - 2026-05-17
 
 **Voice agent reference lands — Mars + Venus personas, WebRTC-first, copy-into-your-repo not stuck-in-gbrain.**
