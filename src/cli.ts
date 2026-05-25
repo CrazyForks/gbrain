@@ -2,6 +2,12 @@
 
 import { installSigchldHandler } from './core/zombie-reap.ts';
 installSigchldHandler();
+// v0.41.6.0 D5: cleanup registry + signal handlers for SIGTERM/SIGHUP/SIGPIPE/
+// uncaughtException. NOT SIGINT (the existing AbortController path at :254
+// owns SIGINT). Installed at module load so locks acquired during boot
+// (e.g. during connectEngine's schema-probe path) are covered too.
+import { installSignalHandlers as installCleanupSignalHandlers } from './core/process-cleanup.ts';
+installCleanupSignalHandlers();
 
 import { readFileSync } from 'fs';
 import { loadConfig, loadConfigWithEngine, toEngineConfig, isThinClient } from './core/config.ts';
@@ -1152,6 +1158,53 @@ async function handleCliOnly(command: string, args: string[]) {
     return;
   }
 
+  // v0.41.6.0 D3 (per outside-voice F1): connect-time + dispatch-time wallclock
+  // timeouts for read-only commands whose hang would otherwise spin at 100% CPU
+  // (the production "10-day zombie gbrain search ping" bug class). The wrap
+  // covers connectEngine (so a hung schema probe / PgBouncer freeze actually
+  // surfaces a timeout) AND the dispatch body (so a wedged runSearch /
+  // runList honors the same deadline).
+  // Per-command default: search 30s, sources list 10s. User --timeout=Ns wins.
+  // Other commands (import, embed, doctor, etc.) keep their existing
+  // unbounded connect — destructive / long-running commands shouldn't get
+  // a default kill switch.
+  const readOnlyDefaultTimeoutMs =
+    command === 'search' ? 30_000 :
+    command === 'sources' && (args[0] === 'list' || args[0] === undefined) ? 10_000 :
+    null;
+  const cliOptsResolved = getCliOptions();
+  const userTimeoutMs = cliOptsResolved.timeoutMs;
+  const readOnlyTimeoutMs = userTimeoutMs ?? readOnlyDefaultTimeoutMs;
+
+  if (readOnlyTimeoutMs !== null) {
+    const { withTimeout, OperationTimeoutError } = await import('./core/timeout.ts');
+    const label = `gbrain ${command}`;
+    let engine: BrainEngine;
+    try {
+      engine = await withTimeout(connectEngine(), readOnlyTimeoutMs, `${label}: connect`);
+    } catch (e) {
+      if (e instanceof OperationTimeoutError) {
+        const hint = userTimeoutMs ? '' : ` (default ${e.ms}ms; pass --timeout=Ns to override)`;
+        console.error(`${e.label} timed out${hint}.`);
+        process.exit(124);
+      }
+      throw e;
+    }
+    try {
+      await withTimeout(dispatchReadOnlyCommand(engine, command, args), readOnlyTimeoutMs, label);
+    } catch (e) {
+      if (e instanceof OperationTimeoutError) {
+        const hint = userTimeoutMs ? '' : ` (default ${e.ms}ms; pass --timeout=Ns to override)`;
+        console.error(`${e.label} timed out${hint}.`);
+        process.exit(124);
+      }
+      throw e;
+    } finally {
+      try { await engine.disconnect(); } catch { /* best-effort */ }
+    }
+    return;
+  }
+
   // All remaining CLI-only commands need a DB connection
   const engine = await connectEngine();
   try {
@@ -1522,6 +1575,30 @@ async function handleCliOnly(command: string, args: string[]) {
   }
 }
 
+/**
+ * v0.41.6.0 D3: dispatch helper for the read-only commands that take a
+ * default wallclock timeout (`gbrain search`, `gbrain sources list`).
+ * Keeps the timeout-wrap site in main() small and the per-command
+ * dispatch logic colocated for easy extension. Pure dispatcher; no engine
+ * lifecycle (caller owns connect/disconnect).
+ */
+async function dispatchReadOnlyCommand(engine: BrainEngine, command: string, args: string[]): Promise<void> {
+  switch (command) {
+    case 'search': {
+      const { runSearch } = await import('./commands/search.ts');
+      await runSearch(engine, args);
+      return;
+    }
+    case 'sources': {
+      const { runSources } = await import('./commands/sources.ts');
+      await runSources(engine, args);
+      return;
+    }
+    default:
+      throw new Error(`dispatchReadOnlyCommand: unsupported command "${command}"`);
+  }
+}
+
 // Build the AIGatewayConfig payload from a GBrainConfig. Both configureGateway
 // sites in connectEngine() pass through this helper so adding a new field
 // touches one place. Adding a field to one site but not the other previously
@@ -1602,22 +1679,36 @@ async function connectEngine(opts?: { probeOnly?: boolean }): Promise<BrainEngin
     return engine;
   }
 
-  // Auto-apply pending schema migrations on connect (#651). Cheap probe
-  // first so already-migrated brains don't pay the bootstrap-probe +
-  // SCHEMA_SQL replay + ledger-check cost on every short-lived CLI call.
-  // This is the conditional version of #652 (oyi77's investigation):
-  // same correctness, no perf regression on the hot path.
+  // v0.41.6.0 D4: race-tolerant CLI-side migration runner. Replaces the
+  // pre-v0.41.6.0 `try { hasPendingMigrations && initSchema() } catch warn`
+  // block that fired the alarming "Schema probe/migrate failed: deadlock
+  // detected" warning on EVERY sync when two CLIs raced on schema probe.
+  // The retry+poll loop quiets the warning when the race resolves
+  // itself (the common case); the revised wording fires only when
+  // migrations are genuinely stuck.
   try {
-    const { hasPendingMigrations } = await import('./core/migrate.ts');
-    if (await hasPendingMigrations(engine)) {
-      await engine.initSchema();
+    const { tryRunPendingMigrations } = await import('./core/migrate.ts');
+    const result = await tryRunPendingMigrations(engine);
+    if (result.status === 'persistent') {
+      console.warn(
+        '  Schema migrations are pending. Another process attempted to apply them ' +
+        'but the migration didn\'t complete within the retry window. This is usually transient.',
+      );
+      console.warn('  If it persists:');
+      console.warn('    1. Check `gbrain doctor` for stale locks or stuck advisory locks.');
+      console.warn('    2. Check `gbrain jobs supervisor status` for crashed migration workers.');
+      console.warn('    3. Re-run: `gbrain apply-migrations --yes`');
+    } else if (result.status === 'error') {
+      // Non-deadlock error during initSchema. Surface the message and continue;
+      // subsequent operations will resurface the real schema error in context.
+      console.warn(`  Schema probe failed: ${result.error.message}`);
+      console.warn('  Re-run: `gbrain apply-migrations --yes`');
     }
+    // 'ok', 'not_needed', 'race_resolved' → silent (the common-case outcomes).
   } catch (err) {
-    // Non-fatal: if probe or initSchema fails, surface a hint and continue
-    // with the connected engine. Subsequent operations will surface the
-    // real schema error in context.
-    console.warn(`  Schema probe/migrate failed: ${(err as Error).message}`);
-    console.warn('  Try: gbrain init --migrate-only');
+    // Last-resort defense in case the helper itself throws unexpectedly.
+    console.warn(`  Schema probe failed (unexpected): ${(err as Error).message}`);
+    console.warn('  Re-run: `gbrain apply-migrations --yes`');
   }
 
   // v0.27.1 (F3 fix): re-merge DB-plane config now that the engine is up.

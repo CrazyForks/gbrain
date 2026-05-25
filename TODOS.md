@@ -1,5 +1,43 @@
 # TODOS
 
+## v0.41.6.0 follow-ups (v0.41.7+)
+
+- [ ] **v0.41.7+: investigate v0.40+ schema-probe deadlock ROOT cause.**
+  v0.41.6.0 D4 ships the symptom fix (retry+poll silently when the race
+  resolves itself; warn with revised wording when truly stuck). Codex
+  outside-voice F12 caught the load-bearing finding: `initSchema()`
+  already takes `pg_advisory_lock(42)` so the SQLSTATE 40P01 race must
+  involve OTHER locks. Hypothesis: DDL locks acquired by initSchema's
+  ALTER / CREATE statements deadlock against application queries
+  (long-running SELECTs on `pages`, PgBouncer pool artifacts). Reproduce
+  on real PgBouncer setup with concurrent reads + simulated migration.
+  Expected outcome: either connection-pool isolation fix or DDL-lock
+  NOWAIT pattern. Effort: human ~4-6h / CC ~1h once repro is in hand.
+  Depends on: nothing; v0.41.6.0 D4 already quiets the alarming warning
+  for the common case, so this investigation is unblocked.
+
+- [ ] **v0.41.7+: wire inline auto-embed errors at sync.ts:1173-1186
+  through `recordSyncFailures`.** v0.41.6.0 D1 closes the headline
+  missing-creds case (preflight short-circuits before any embed call).
+  D2's classifier patterns cover rate-limit / quota / oversize errors
+  for per-file embeds inside `runImport` (which already records
+  failures correctly). But the inline post-import auto-embed catch at
+  `src/commands/sync.ts:1173-1186` swallows errors to stderr only and
+  never reaches `recordSyncFailures`. Wire it through with deduplication
+  guard (some errors may also be recorded by per-file `runImport` —
+  avoid double-recording). Effort: human ~1d / CC ~30min including
+  dedup test surface.
+
+- [ ] **v0.41.7+: true end-to-end cancellation in search via AbortSignal.**
+  v0.41.6.0 D3 `withTimeout` bounds USER wait via Promise.race + process
+  exit. The underlying DB / API socket keeps running until the kernel
+  reaps the process or the server times out the abandoned query. For
+  long-running subagent loops or rerank pipelines, threading AbortSignal
+  end-to-end would save server-side resources. Touches `hybridSearch` +
+  engine + `cosineReScore` + `reranker` signatures. Effort: human ~1d /
+  CC ~3h. Tradeoff: large surface fan-out for marginal benefit on the
+  CLI exit-on-timeout path. Only ship when a non-CLI consumer
+  (HTTP MCP, future autopilot health checks) wants true cancellation.
 ## community-pr-wave follow-ups (filed during ship)
 
 - [ ] **`FREE_LOCAL_*_PROVIDERS` zero-pricing bypassable via redirected

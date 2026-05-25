@@ -1633,6 +1633,58 @@ export function checkAutopilotLockScope(): Check {
 }
 
 /**
+ * v0.41.6.0 D3 — stale_locks doctor check.
+ *
+ * Surfaces every row in `gbrain_cycle_locks` whose `ttl_expires_at < NOW()`.
+ * The TTL is the canonical staleness signal already trusted by
+ * tryAcquireDbLock's UPDATE-on-conflict SQL — when TTL is in the past,
+ * the next acquire attempt will sweep the row anyway. Doctor's job is to
+ * warn the user proactively so the next sync doesn't get a surprise
+ * "Another sync is in progress" with no fix hint.
+ *
+ * Paste-ready hint per stale lock: names the source-id from the
+ * `gbrain-sync:<source>` lock-key shape so users can copy-paste the
+ * exact recovery command.
+ *
+ * Out of scope (filed as v0.41+ follow-up TODO): detection of
+ * "wedged but TTL-refreshing" locks where a refresh thread is alive
+ * but the main work is blocked. Requires explicit heartbeat probe;
+ * speculation until production data shows the case.
+ */
+export async function checkStaleLocks(engine: BrainEngine): Promise<Check> {
+  try {
+    const { listStaleLocks } = await import('../core/db-lock.ts');
+    const stale = await listStaleLocks(engine);
+    if (stale.length === 0) {
+      return { name: 'stale_locks', status: 'ok', message: 'No stale locks (no rows with ttl_expires_at < NOW())' };
+    }
+    const lines = stale.slice(0, 10).map(s => {
+      const ageH = Math.floor(s.age_ms / 3600_000);
+      const source = s.id.startsWith('gbrain-sync:') ? s.id.slice('gbrain-sync:'.length) : null;
+      const breakHint = source ? `gbrain sync --break-lock --source ${source}` : `gbrain sync --break-lock`;
+      return `  ${s.id} (pid ${s.holder_pid} on ${s.holder_host}, age ${ageH}h) → ${breakHint}`;
+    });
+    const tail = stale.length > 10 ? `  ... and ${stale.length - 10} more.` : null;
+    return {
+      name: 'stale_locks',
+      status: 'warn',
+      message: [
+        `${stale.length} stale lock(s) detected (ttl_expires_at < NOW()):`,
+        ...lines,
+        tail,
+      ].filter(Boolean).join('\n'),
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Pre-v0.30 brains may not have the gbrain_cycle_locks table yet.
+    if (/relation .* does not exist|no such table/i.test(msg)) {
+      return { name: 'stale_locks', status: 'ok', message: 'gbrain_cycle_locks table not yet provisioned (skipping)' };
+    }
+    return { name: 'stale_locks', status: 'warn', message: `Check failed: ${msg}` };
+  }
+}
+
+/**
  * v0.38 — cycle_phase_scope check (informational).
  *
  * Renders the static `PHASE_SCOPE` taxonomy from `src/core/cycle.ts` so
@@ -4734,6 +4786,9 @@ export async function buildChecks(
     // 5M — autopilot_lock_scope (PID-safe hint per codex CF11)
     progress.heartbeat('autopilot_lock_scope');
     checks.push(checkAutopilotLockScope());
+    // v0.41.6.0 D3 — stale_locks (gbrain_cycle_locks rows with ttl_expires_at < NOW())
+    progress.heartbeat('stale_locks');
+    checks.push(await checkStaleLocks(engine));
     // v0.38 — cycle_phase_scope (informational; no DB cost)
     progress.heartbeat('cycle_phase_scope');
     checks.push(checkCyclePhaseScope());

@@ -2,6 +2,54 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.9.0] - 2026-05-25
+
+**Five UX/reliability fixes from a single production incident report. Your
+brain stops getting wedged for days when a CLI hangs, your sync stops
+failing 565 files one-at-a-time when an API key is missing, and your error
+messages start telling you what to actually do.**
+
+A gstack user ran `gbrain sync --full` against a 137-file repo and ran
+into five distinct defects in one session. The defects are independent
+but all live in the CLI entrypoint, sync orchestrator, and lock
+infrastructure. They ship as one reliability-hardening wave.
+
+What you can now do:
+
+- **`gbrain sync` checks your embedding credentials up front.** If
+  `OPENAI_API_KEY` is missing, you get one clean error line with a
+  paste-ready fix, not 565 identical failures in your sync-failures.jsonl.
+  Same check on `gbrain embed` and `gbrain import`. Bypass with
+  `--no-embed` if you want to import without embedding.
+- **Failed-sync errors are now bucketed properly.** Embedding failures
+  show up as `EMBEDDING_NO_CREDS`, `EMBEDDING_RATE_LIMIT`,
+  `EMBEDDING_QUOTA`, or `EMBEDDING_OVERSIZE` instead of bucketing into
+  the meaningless `UNKNOWN` pile. `gbrain doctor` summary actually tells
+  you what's wrong.
+- **`gbrain search` and `gbrain sources list` have default timeouts.**
+  30s for search, 10s for sources list. The connect step is bounded too,
+  so a hang in DB connect (PgBouncer freeze, hung TCP) can't spin at
+  100% CPU for days. Override with `--timeout=Ns`.
+- **`gbrain sync` lock-busy error names the holder.** When another sync
+  is already running, the error tells you the holder's PID, hostname,
+  and how long it's been running. If the holder is dead, run
+  `gbrain sync --break-lock` to clear it. If it's wedged but alive,
+  `gbrain sync --force-break-lock` (use carefully).
+- **`gbrain doctor` flags stale locks.** New `stale_locks` check
+  surfaces any lock row whose TTL has expired, with a paste-ready
+  break-lock hint per source.
+- **The "Schema probe/migrate failed: deadlock detected" warning stops
+  firing on every sync.** When two CLIs race on schema probe, the
+  retry-and-poll logic resolves the race silently. The warning only
+  surfaces when migrations are genuinely stuck, and its wording no
+  longer suggests the destructive-sounding `gbrain init --migrate-only`.
+- **`gbrain sync | head -20` exits cleanly.** SIGPIPE handling +
+  process-cleanup registry release locks on abnormal termination so a
+  truncated pipe doesn't wedge the next sync.
+
+To take advantage of v0.41.6.0: just `gbrain upgrade` and re-run your
+flow. No manual migration needed. New `--break-lock` / `--force-break-lock`
+flags are documented in `gbrain sync --help`.
 ## [0.41.8.0] - 2026-05-24
 
 **`gbrain search`, `gbrain query`, and `gbrain get` now actually exit when they finish on PGLite.**
