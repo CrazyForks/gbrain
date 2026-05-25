@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.41.10.0] - 2026-05-25
+## [0.41.10.1] - 2026-05-25
 
 **Background sweeps stop silently losing rows, `dream.*` config you set actually reaches the cycle, and switching embedding providers won't quietly corrupt your brain when env vars override the switch.** Three production reliability fixes landed in one wave, rebuilt from three closed community PRs (#1414, #1416, #1421 from `@garrytan-agents`) with structural improvements from `/plan-eng-review` + codex outside-voice review.
 
@@ -87,7 +87,7 @@ What we caught and fixed before merging. Codex outside-voice review caught 10 re
 
 **Credit:** rebuilt from work originally proposed by @garrytan-agents in PRs #1414, #1416, #1421. The PR descriptions were the design source — the rebuild's structural improvements came from /plan-eng-review and codex outside-voice. Closes both bug classes (the reported PgBouncer batch loss and the documented 716K-chunk damage incident).
 
-## To take advantage of v0.41.10.0
+## To take advantage of v0.41.10.1
 
 `gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
 warns about a partial migration:

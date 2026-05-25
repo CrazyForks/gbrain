@@ -1,9 +1,9 @@
 # TODOS
 
-## v0.41.10.0 fix-wave follow-ups (v0.42+)
+## v0.41.10.1 fix-wave follow-ups (v0.42+)
 
 - [ ] **v0.42+: per-atom idempotency via deterministic atom slug.** The
-  v0.41.10.0 fix wave closed the duplicate-atoms bug class via source-hash
+  v0.41.10.1 fix wave closed the duplicate-atoms bug class via source-hash
   existence check at the SOURCE level (skip the whole transcript/page if
   any atom row exists for `frontmatter.source_hash`). Known limitation
   surfaced by codex review (D9 #2): if the first Haiku call writes atom
@@ -18,7 +18,7 @@
   `src/core/cycle/extract-atoms.ts:atomsExistForHash`, the documented
   known-limitation comment in the file header.
 
-- [ ] **v0.42+: atom-slug consolidation migration.** The v0.41.10.0 fix
+- [ ] **v0.42+: atom-slug consolidation migration.** The v0.41.10.1 fix
   wave stops NEW duplicates from being written but doesn't migrate
   existing duplicate atoms from prior v0.41.2.0 runs. Brains that ran
   the cycle across multiple days carry duplicate atoms forever (or until
