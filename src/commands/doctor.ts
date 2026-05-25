@@ -3461,6 +3461,59 @@ export async function buildChecks(
     checks.push({ name: 'graph_coverage', status: 'warn', message: 'Could not check graph coverage' });
   }
 
+  // 9b. v0.42.0.0 — orphan_ratio check (migration #1 of #1409).
+  //
+  // Surfaces the fraction of linkable pages with no inbound links.
+  // Consumes the same canonical getOrphansData() pure fn as
+  // `gbrain orphans --count` (D1), so the two surfaces cannot disagree.
+  //
+  // Skip when entity count < 100 (vacuous — small brains naturally
+  // show high orphan ratio; not actionable signal).
+  // Warn at >0.5; fail at >0.8. Both states recommend
+  // `gbrain extract links --by-mention` as the fix.
+  progress.heartbeat('orphan_ratio');
+  try {
+    const { getOrphansData } = await import('./orphans.ts');
+    const entityCount = (await engine.executeRaw<{ count: number }>(
+      "SELECT COUNT(*)::int AS count FROM pages WHERE type IN ('entity', 'person', 'company', 'organization') AND deleted_at IS NULL",
+    ))[0]?.count ?? 0;
+    if (entityCount < 100) {
+      checks.push({
+        name: 'orphan_ratio',
+        status: 'ok',
+        message: `Vacuous: ${entityCount} entity pages (<100). Orphan ratio not meaningful at this scale.`,
+      });
+    } else {
+      const data = await getOrphansData(engine, { includePseudo: false });
+      const ratio = data.total_linkable > 0 ? data.total_orphans / data.total_linkable : 0;
+      const pct = (ratio * 100).toFixed(0);
+      const hint =
+        'Run: gbrain extract links --by-mention   (auto-links entity mentions in body text). ' +
+        'Run gbrain orphans for the list.';
+      if (ratio > 0.8) {
+        checks.push({
+          name: 'orphan_ratio',
+          status: 'fail',
+          message: `Orphan ratio ${pct}% (${data.total_orphans}/${data.total_linkable} linkable pages have no inbound links). ${hint}`,
+        });
+      } else if (ratio > 0.5) {
+        checks.push({
+          name: 'orphan_ratio',
+          status: 'warn',
+          message: `Orphan ratio ${pct}% (${data.total_orphans}/${data.total_linkable} linkable pages have no inbound links). ${hint}`,
+        });
+      } else {
+        checks.push({
+          name: 'orphan_ratio',
+          status: 'ok',
+          message: `Orphan ratio ${pct}% (${data.total_orphans}/${data.total_linkable} linkable pages)`,
+        });
+      }
+    }
+  } catch {
+    checks.push({ name: 'orphan_ratio', status: 'warn', message: 'Could not check orphan ratio' });
+  }
+
   // 10. Integrity sample scan (v0.13 knowledge runtime).
   // Read-only — no network, no writes, no resolver calls. Samples the first
   // 500 pages by slug order and surfaces bare-tweet + dead-link counts as a
