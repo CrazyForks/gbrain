@@ -107,7 +107,7 @@ const OVERLAP_WHITELIST = new Set([
   'brain-ops',        // always-on, every brain read/write
 ]);
 
-interface ResolverEntry {
+export interface ResolverEntry {
   trigger: string;
   skillPath: string;       // e.g., 'skills/query/SKILL.md'
   isGStack: boolean;       // GStack: X entries (external, skip file check)
