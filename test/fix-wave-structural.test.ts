@@ -78,9 +78,20 @@ describe('v0.36.1.x #1077 — admin register-client supports PKCE public clients
     // (under either name) from req.body. Pin the fallback pattern so the
     // PKCE-fix regression contract stays load-bearing.
     expect(src).toMatch(/req\.body[^;]*scopes\s*\?\?\s*[^;]*scope\b/);
-    // PKCE branch NULLs client_secret_hash + sets auth method to 'none'
-    expect(src).toMatch(/tokenEndpointAuthMethod\s*===\s*'none'/);
-    expect(src).toMatch(/client_secret_hash\s*=\s*NULL,\s*token_endpoint_auth_method\s*=\s*'none'/);
+    // v0.41.3 (T4 atomicity fix, codex F4): admin endpoint now validates
+    // tokenEndpointAuthMethod via the shared validator and passes it to
+    // registerClientManual as a positional arg. Pre-v0.41.3 the route did
+    // INSERT (confidential) → UPDATE (NULL out secret_hash) for the 'none'
+    // case, which left a confidential row stranded if the UPDATE failed.
+    // Atomic now: one INSERT writes the correct shape; no post-insert
+    // UPDATE block (the regex deliberately asserts the post-insert UPDATE
+    // is GONE).
+    expect(src).toMatch(/validateTokenEndpointAuthMethod\(tokenEndpointAuthMethod\)/);
+    expect(src).toMatch(/registerClientManual\([^)]*validatedAuthMethod[^)]*\)/);
+    // Regression guard: post-insert UPDATE flipping client_secret_hash to
+    // NULL based on a runtime check is exactly the non-atomic pattern T4
+    // killed. Re-introducing it brings back codex F4.
+    expect(src).not.toMatch(/UPDATE oauth_clients SET client_secret_hash = NULL, token_endpoint_auth_method = 'none'/);
   });
 });
 

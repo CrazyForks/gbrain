@@ -1,5 +1,94 @@
 # TODOS
 
+## community-pr-wave follow-ups (filed during ship)
+
+- [ ] **`FREE_LOCAL_*_PROVIDERS` zero-pricing bypassable via redirected
+  BASE_URL env vars.** An operator who sets `LLAMA_SERVER_BASE_URL=https://paid-api.com/v1`
+  routes `llama-server:foo` requests to a paid proxy, but the budget
+  tracker still zero-prices them because the provider-prefix match in
+  `FREE_LOCAL_EMBED_PROVIDERS` / `FREE_LOCAL_RERANK_PROVIDERS` doesn't
+  see the resolved URL. The bypass is real but requires operator
+  misconfiguration (paid-API behind a "local" recipe alias) — same
+  trust posture as the rest of the BASE_URL env vars.
+
+  Fix shape (couples with the unification TODO already filed for v0.41+):
+  move the freeness decision from provider-prefix lookup to the gateway's
+  embed/rerank call sites where the resolved URL is known, or detect
+  non-loopback `provider_base_urls` and refuse zero-pricing in that case.
+
+  Surfaced by codex Pass-9 adversarial review; pre-existing for the rerank
+  case in v0.40.7.1, broadened to embed by v0.40.8.0. Tracked here so the
+  unification PR closes both at once.
+
+- [ ] **`probeEmbeddingReachability` should honor recipe `default_timeout_ms`
+  for embed touchpoint.** The reranker probe was just fixed in PR #1326 to
+  read `recipe.touchpoints.reranker.default_timeout_ms` so Qwen3-Reranker-4B
+  has CPU cold-start headroom. The embedding probe hardcodes 5000ms
+  (`src/commands/models.ts:467`) and the JSDoc admits "the 5s timeout may
+  trip on the very first probe — re-run if so." A local llama-server embed
+  endpoint hits the identical CPU cold-start curve.
+
+  Fix: add optional `default_timeout_ms?: number` to `EmbeddingTouchpoint`
+  in `src/core/ai/types.ts` (sibling to the rerank field), thread through
+  `probeEmbeddingReachability` using the same `recipe.touchpoints.embedding.default_timeout_ms ?? 5000`
+  pattern that the reranker probe uses. Add a regression test in
+  `test/models-doctor-embed.test.ts` pinning the precedence chain.
+
+  Surfaced by the community-PR-wave pre-landing review (informational, no
+  blocker on the wave itself — workaround is "re-run the probe").
+## v0.41.3 security/MCP fix wave follow-ups (filed during ship of `garrytan/security-mcp-fix-wave`)
+
+Source: codex outside-voice review on the v0.41.3 wave (D7) identified
+three real wins in PR #1316 (`chipoto69` — "Phase 4 multi-agent hardening")
+that did NOT land in v0.41.3. PR #1316 was bundled with RLS posture
+changes that conflict with v0.26.7's auto-RLS event trigger; the v0.41.3
+plan unbundled #1316 deliberately so its RLS posture rewrite gets its own
+architectural review. These three are the deferred standalone wins —
+each can ship as its own wave without touching RLS.
+
+- [ ] **T13a (P1) — Extract deny-by-default fine-grained scope wiring
+  from #1316.** Today the OAuth scope string (e.g. `read write`) is
+  validated at registration via `ALLOWED_SCOPES_LIST` but does NOT
+  constrain which MCP operations a token can call at dispatch time.
+  Every op currently runs if the bearer is valid. #1316 adds per-op
+  `requiredScope` metadata and a dispatch-time gate that returns 403
+  when the bearer's scope set doesn't satisfy the op's requirement.
+  Real security win: a `read`-scoped token can't call `put_page` or
+  `submit_job`. Requires per-op annotation review (which ops need
+  `write` vs `admin`) + scope-grammar decision (is `read` a strict
+  subset of `write`, or are they orthogonal categories?). NOT in
+  v0.41.3 because the per-op review is its own design exercise.
+  Cherry-pick starter: PR #1316 diff against `src/core/operations.ts`
+  and `src/mcp/dispatch.ts`. Effort: human ~2 days / CC ~3 hours.
+
+- [ ] **T13b (P2) — Extract real operation names in mcp_request_log
+  from #1316.** Pre-fix audit log records generic `tools/call` for
+  every MCP request. #1316 carries the real op name (`get_page`,
+  `put_page`, `submit_job`, etc.) into the `operation` column.
+  Standalone win — no architectural risk, no schema change (column
+  already exists), just dispatch-time wiring. Candidate for next
+  minor (v0.41.4 or v0.42.x). Cherry-pick starter: #1316 diff
+  against `src/mcp/dispatch.ts` audit-log insertion site.
+  Effort: human ~1h / CC ~10min.
+
+- [ ] **T13c (P2) — Extract `access_tokens.last_used_at` LRU debounce
+  from #1316.** Today `last_used_at` is updated on every bearer
+  request via the legacy transport's SQL-level WHERE-clause throttle
+  (60s minimum gap). On high-traffic deployments the hot-row writes
+  still hit Postgres for every request. #1316 adds an in-process LRU
+  cache so the SQL UPDATE only fires once per token per cooldown
+  window. Useful on multi-agent fleets sharing tokens at high rate;
+  no value for personal-laptop installs. NOT a blocker. Cherry-pick
+  starter: #1316's `src/core/token-last-used.ts` + the wiring in
+  `src/mcp/http-transport.ts:validateToken`. Effort: human ~2h /
+  CC ~20min.
+
+**NOT filed:** the RLS posture rewrite from #1316. That changes the
+v0.26.7 auto-RLS event trigger that `gbrain doctor`'s
+`rls_event_trigger` check treats as load-bearing; it deserves its own
+plan-eng-review + doctor-check rewrite + breaking-change CHANGELOG
+note. Filing it as a TODO would imply it's ready to pull; it isn't.
+
 ## v0.41.0.0 follow-ups (v0.41.1+)
 
 - [ ] **v0.41+: per-key rate-lease caps (`openai:responses`, `google:gemini`, etc.).**
@@ -12,7 +101,7 @@
   + `src/core/minions/handlers/subagent.ts:GBRAIN_ANTHROPIC_MAX_INFLIGHT`.
 
 - [ ] **v0.41+: `minion_lease_pressure_log` + budget/self-fix audit retention sweep.**
-  v0.41 migration v93 promoted `ON DELETE SET NULL` on audit FKs so rows
+  v0.41 migration v94 promoted `ON DELETE SET NULL` on audit FKs so rows
   survive `gbrain jobs prune`. Codex pass-3 #5 caught the corollary: without
   retention, audit tables grow unbounded. On a steady-pressure install
   (heavy daily batches), `minion_lease_pressure_log` is millions of rows by
@@ -53,6 +142,7 @@
   current behavior (truncate-then-fail) is safe — no infinite loops,
   depth-cap prevents chains — but full semantic reduction unlocks higher
   self-fix success rates on legitimately-long prompts.
+
 ## v0.41 content-sanity follow-ups (filed during ship of `garrytan/lint-page-size-gate`)
 
 Source: CEO + Eng review on the content-sanity defense plan. Both reviews
@@ -540,6 +630,60 @@ at plan time and got carved out:
   alongside the staleness number so doctor surfaces the coverage gap inline.
   Implementation: reuse `buildSyncStatusReport` from `src/commands/sync.ts`,
 
+## v0.40.6.1 llama-server-reranker follow-ups (v0.40.7+)
+
+Filed from the /ship Claude adversarial subagent review against this PR. None are
+exploitable today; they harden the new local-reranker surface against future
+contributor traps.
+
+- [ ] **P1: SSRF scheme validation sweep for all 6 openai-compat `_BASE_URL` env vars.**
+  `src/cli.ts:1483-1487` accepts `LLAMA_SERVER_BASE_URL`, `LLAMA_SERVER_RERANKER_BASE_URL`,
+  `OLLAMA_BASE_URL`, `LMSTUDIO_BASE_URL`, `LITELLM_BASE_URL`, `OPENROUTER_BASE_URL` with
+  zero scheme validation. A `file://` or `gopher://` value silently becomes the
+  recipe's base URL. Pre-existing pattern; this wave adds one more env var to the gap
+  without expanding the class. Fix: add a `validateOpenAICompatBaseURL(url)` helper
+  (assert `http(s):` scheme + reuse `src/core/ssrf-validate.ts` private-IP checks
+  for the non-localhost case), apply to all 6 envs at the `buildGatewayConfig` site.
+  ~20 LOC + 6 test cases. Should be its own focused PR.
+
+- [ ] **P2: Document `FREE_LOCAL_RERANK_PROVIDERS` invariant.** `src/core/budget/budget-tracker.ts:lookupPricing`
+  returns `{input:0, output:0}` for any model id under the `llama-server-reranker:`
+  provider on the rerank kind. The contract relies on all callers going through
+  `gateway.rerank()`'s `assertTouchpoint`-with-extended-models check (which validates
+  the model exists before pricing fires). Theoretical bypass: a future caller that
+  reserves directly against BudgetTracker with `kind: 'rerank'` and an arbitrary
+  `llama-server-reranker:<anything>` model id gets free pricing. Fix: code comment
+  documenting the invariant, OR move the freeness check to gateway.rerank() where
+  the validation already runs.
+
+- [ ] **P2: Recipe path-concat sanity check at gateway-init.** `src/core/ai/gateway.ts:rerank()`
+  concatenates `${compat.baseURL.replace(/\/$/, '')}${tp.path ?? '/models/rerank'}`.
+  A future recipe with `path: 'rerank'` (no leading slash) produces `…/v1rerank`;
+  a future recipe with `path: '/v1/rerank'` when `base_url_default` already ends
+  in `/v1` reintroduces the codex-caught doubling bug. Fix: at `configureGateway`
+  time, assert `tp.path` (when set) starts with `/` and warn-log when the recipe
+  pattern looks doubling-prone. Surface at init, not first-rerank.
+
+- [ ] **P3: Debug-log on malformed `search.reranker.model`.** `src/core/search/mode.ts:lookupRerankerRecipeDefaultTimeout`
+  silently returns undefined when `getRecipe(providerId)` misses (typos, malformed
+  strings). Fail-open is correct for timeouts (5000ms is a safe bundle default),
+  but the user-facing UX is "config was set, nothing changed" with no signal.
+  Fix: stderr-log once when `modelStr` is non-empty but the provider id doesn't
+  resolve, gated by `GBRAIN_DEBUG=1`.
+
+- [ ] **P3: Narrow `resolveLiveRerankerModel` catch.** `src/commands/models.ts:resolveLiveRerankerModel`
+  has a blanket `try/catch` around `loadSearchModeConfig` + `resolveSearchMode`
+  that falls back to `getRerankerModel()`. Real errors (schema-version mismatch,
+  malformed config JSON, engine connectivity blip) get hidden behind a misleading
+  "not configured" doctor verdict. Fix: narrow the catch to specific shapes OR
+  emit `GBRAIN_DEBUG=1` stderr warning before falling back.
+
+- [ ] **P3: Validate `modelStr` shape before allocating probe timeout.**
+  `src/commands/models.ts:probeRerankerReachability` resolves the recipe + sets
+  `probeTimeoutMs = 30000` before checking that `modelStr` has a non-empty model
+  half. Result: `llama-server-reranker:` (trailing colon, empty model) waits 30s
+  before failing at `assertTouchpoint`. Fix: regex-validate `modelStr` shape
+  (`^[a-z][a-z0-9-]*:[a-zA-Z0-9_.-]+$`) before timeout allocation.
 
 ## v0.40.1.0 Track D follow-ups (v0.41+)
 

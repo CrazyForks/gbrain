@@ -390,7 +390,8 @@ describe('runCycle — yieldBetweenPhases hook', () => {
     // v0.33.3: 13 phases (added `resolve_symbol_edges` between extract_facts and patterns) → 13 yield calls.
     // v0.36.1.0: 16 phases (added `propose_takes`, `grade_takes`, `calibration_profile` between consolidate and embed).
     // v0.39.0.0: 17 phases (added `schema-suggest` between orphans and purge — T12 schema cathedral).
-    expect(hookCalls).toBe(17);
+    // v0.41.2.0: 19 phases (added `extract_atoms` after extract_facts + `synthesize_concepts` after patterns).
+    expect(hookCalls).toBe(19);
   });
 
   test('hook exceptions do not abort the cycle', async () => {
@@ -403,7 +404,7 @@ describe('runCycle — yieldBetweenPhases hook', () => {
     // v0.33.3: 13 phases (v0.32.2's 12 + resolve_symbol_edges).
     // v0.36.1.0: 16 phases (Hindsight calibration wave adds propose_takes, grade_takes, calibration_profile).
     // v0.39.0.0: 17 phases (T12 schema-suggest phase between orphans and purge).
-    expect(report.phases.length).toBe(17);
+    expect(report.phases.length).toBe(19); // v0.41: +extract_atoms, +synthesize_concepts
   });
 });
 
