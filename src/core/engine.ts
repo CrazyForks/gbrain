@@ -16,6 +16,7 @@ import type {
   EmotionalWeightInputRow, EmotionalWeightWriteRow,
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
   AdjacencyRow,
+  EnrichCandidatesOpts, EnrichCandidate,
 } from './types.ts';
 
 /**
@@ -2017,6 +2018,20 @@ export interface BrainEngine {
    * Postgres (eng review D5 — avoids dialect drift on `interval` binding).
    */
   getRecentSalience(opts: SalienceOpts): Promise<SalienceResult[]>;
+
+  /**
+   * v0.41.39 (issue #1700) — enrich candidate selection for
+   * `gbrain enrich --thin`. ONE source-aware SQL query: thin-filter +
+   * per-page inbound-link count (source-correct via `to_page_id = p.id`,
+   * `link_source='mentions'` excluded) + optional `enriched_at` recency
+   * guard + whitelisted ORDER BY (ENRICH_ORDER_SQL) + LIMIT. Returns a
+   * lightweight projection (NO page bodies) so ranking 100K stubs doesn't
+   * pull every body into memory.
+   *
+   * Empty `opts.types` → empty result, no SQL. Source scope follows the
+   * canonical scalar/array precedence (sourceIds wins over sourceId).
+   */
+  listEnrichCandidates(opts: EnrichCandidatesOpts): Promise<EnrichCandidate[]>;
 
   /**
    * Anomaly detection: cohorts (tag, type) with unusually-high page activity

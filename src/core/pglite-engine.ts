@@ -40,11 +40,12 @@ import type {
   SalienceOpts, SalienceResult, AnomaliesOpts, AnomalyResult,
   EmotionalWeightInputRow, EmotionalWeightWriteRow,
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
+  EnrichCandidatesOpts, EnrichCandidate,
 } from './types.ts';
 import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, takeRowToTake, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { normalizeWeightForStorage } from './takes-fence.ts';
-import { GBrainError, PAGE_SORT_SQL } from './types.ts';
+import { GBrainError, PAGE_SORT_SQL, ENRICH_ORDER_SQL } from './types.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte } from './search/sql-ranking.ts';
@@ -5096,6 +5097,78 @@ export class PGLiteEngine implements BrainEngine {
       take_count: Number(r.take_count ?? 0),
       take_avg_weight: Number(r.take_avg_weight ?? 0),
       score: Number(r.score ?? 0),
+    }));
+  }
+
+  async listEnrichCandidates(opts: EnrichCandidatesOpts): Promise<EnrichCandidate[]> {
+    // v0.41.39 (issue #1700). Parity with postgres-engine.listEnrichCandidates.
+    if (!opts.types || opts.types.length === 0) return [];
+    const limit = Math.max(1, Math.min(opts.limit ?? 50, 5000));
+    const threshold = Math.max(0, opts.thinThreshold);
+
+    const params: unknown[] = [];
+    params.push(opts.types);
+    const typesParam = `$${params.length}`;
+    params.push(threshold);
+    const thresholdParam = `$${params.length}`;
+
+    const where: string[] = [
+      'p.deleted_at IS NULL',
+      `p.type = ANY(${typesParam}::text[])`,
+      `(char_length(p.compiled_truth) + char_length(COALESCE(p.timeline, ''))) < ${thresholdParam}`,
+    ];
+
+    // Source scope: array wins over scalar.
+    if (opts.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      where.push(`p.source_id = ANY($${params.length}::text[])`);
+    } else if (opts.sourceId) {
+      params.push(opts.sourceId);
+      where.push(`p.source_id = $${params.length}`);
+    }
+
+    // Re-enrich recency guard. Lexical text compare on the ISO `enriched_at`
+    // (never cast → can't throw on a malformed value). NULL → eligible.
+    const reenrichMs = opts.reenrichAfterMs ?? 0;
+    if (reenrichMs > 0) {
+      params.push(new Date(Date.now() - reenrichMs).toISOString());
+      where.push(
+        `NOT (p.frontmatter ->> 'enriched_at' IS NOT NULL AND p.frontmatter ->> 'enriched_at' > $${params.length})`,
+      );
+    }
+
+    const orderKey = ENRICH_ORDER_SQL[opts.order] ? opts.order : 'inbound-links';
+    const orderBy = ENRICH_ORDER_SQL[orderKey];
+
+    params.push(limit);
+    const limitParam = `$${params.length}`;
+
+    const { rows } = await this.db.query(
+      `SELECT
+         p.slug,
+         p.source_id,
+         p.title,
+         p.type,
+         (char_length(p.compiled_truth) + char_length(COALESCE(p.timeline, ''))) AS body_len,
+         COALESCE((
+           SELECT COUNT(*)
+             FROM links l
+            WHERE l.to_page_id = p.id
+              AND l.link_source IS DISTINCT FROM 'mentions'
+         ), 0)::int AS inbound_count
+       FROM pages p
+       WHERE ${where.join(' AND ')}
+       ORDER BY ${orderBy}
+       LIMIT ${limitParam}`,
+      params,
+    );
+    return (rows as Record<string, unknown>[]).map((r) => ({
+      slug: String(r.slug),
+      source_id: String(r.source_id),
+      title: String(r.title ?? ''),
+      type: r.type as EnrichCandidate['type'],
+      body_len: Number(r.body_len ?? 0),
+      inbound_count: Number(r.inbound_count ?? 0),
     }));
   }
 

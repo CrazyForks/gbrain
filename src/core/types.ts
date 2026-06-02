@@ -432,6 +432,70 @@ export interface SalienceResult {
 }
 
 /**
+ * v0.41.39 (issue #1700) — `gbrain enrich --thin` candidate selection.
+ *
+ * One source-aware SQL query enumerates thin (stub) pages of the given
+ * types, computes a source-correct inbound-link count per page, applies an
+ * optional re-enrich recency guard, orders by the chosen signal, and slices
+ * to `limit`. Returns a LIGHTWEIGHT projection (no page bodies) so a 100K-
+ * page brain doesn't pull every stub body into memory just to rank them.
+ *
+ * Why a dedicated engine method instead of composing `listPages` +
+ * `getBacklinkCounts` in memory:
+ *   - `getBacklinkCounts` groups by bare `slug`, so the same slug in two
+ *     sources collapses/contaminates the count. This query counts inbound
+ *     links per page row (`to_page_id = p.id`), which is source-correct by
+ *     construction.
+ *   - `listPages` returns full `Page` rows (bodies). 500 stub bodies per
+ *     type per source is not a memory guarantee. This projection carries
+ *     only `body_len`, never the body.
+ */
+export interface EnrichCandidatesOpts {
+  /** Page types to consider (e.g. ['person', 'company']). Empty → no rows. */
+  types: PageType[];
+  /** Body-length (chars) below which a page is "thin". */
+  thinThreshold: number;
+  /** Ordering signal. Whitelisted via ENRICH_ORDER_SQL. */
+  order: 'inbound-links' | 'updated' | 'salience';
+  /** Max rows to return. */
+  limit: number;
+  /**
+   * Skip pages whose frontmatter `enriched_at` is newer than
+   * `now - reenrichAfterMs`. Omitted/0 → no recency guard (every thin page
+   * is eligible). Pages never enriched (no `enriched_at`) are always eligible.
+   */
+  reenrichAfterMs?: number;
+  /** Single-source scope (canonical scalar form). */
+  sourceId?: string;
+  /** Federated read scope (array form, wins over scalar). */
+  sourceIds?: string[];
+}
+
+/** v0.41.39 — one row per enrich candidate. Lightweight: NO page body. */
+export interface EnrichCandidate {
+  slug: string;
+  source_id: string;
+  title: string;
+  type: PageType;
+  /** char_length(compiled_truth) + char_length(timeline). */
+  body_len: number;
+  /** Source-correct inbound-link count (excludes `link_source='mentions'`). */
+  inbound_count: number;
+}
+
+/**
+ * v0.41.39 — whitelisted ORDER BY fragments for EnrichCandidatesOpts.order.
+ * No SQL-injection risk: callers pass the enum, engines map to these literal
+ * fragments. Every fragment ends with the (source_id, slug) tiebreaker so
+ * tied scores produce a deterministic order across engines and runs.
+ */
+export const ENRICH_ORDER_SQL: Record<EnrichCandidatesOpts['order'], string> = {
+  'inbound-links': 'inbound_count DESC, p.source_id ASC, p.slug ASC',
+  'updated':       'p.updated_at DESC, p.source_id ASC, p.slug ASC',
+  'salience':      'p.emotional_weight DESC, inbound_count DESC, p.source_id ASC, p.slug ASC',
+};
+
+/**
  * v0.29 — Anomaly detection: cohorts (tag, type) with unusually-high activity in a window.
  * Cohort baseline is computed over `lookback_days` excluding `since`; current count is
  * the number of distinct pages touched on `since`. A cohort is anomalous when its
@@ -665,6 +729,11 @@ export interface SearchResult {
    *  Undefined when no reranker fired. The raw reranker relevance score
    *  is separately stamped as `rerank_score` for back-compat. */
   reranker_delta?: number;
+  /** Raw cross-encoder relevance score stamped by applyReranker on the
+   *  reranked head (undefined when no reranker fired). Distinct from `score`
+   *  (RRF + boosts). v0.42.3.0 autocut cuts on this — the trustworthy
+   *  separatrix — never on RRF/cosine. */
+  rerank_score?: number;
   /**
    * v0.42 (T19, plan D6) — multiplier applied by applyAliasResolvedBoost
    * (1.0 = unchanged; default 1.05x). Fires when the result's slug is
@@ -783,6 +852,14 @@ export interface SearchOpts {
    * See src/core/search/return-policy.ts.
    */
   adaptiveReturn?: import('./search/return-policy.ts').AdaptiveReturnInput;
+  /**
+   * v0.42.3.0 — autocut (score-discontinuity result-sizing). Default-ON in
+   * reranked modes (the floor). Pass `false` to force the full top-K for breadth
+   * / exploration (the ceiling override). Cuts the ranked set at the largest
+   * cross-encoder rerank-score cliff; no-op without a reranker. Only fires when
+   * offset===0. See src/core/search/autocut.ts.
+   */
+  autocut?: import('./search/autocut.ts').AutocutInput;
   type?: PageType;
   /**
    * v0.33: multi-type filter. When set, search results are filtered to
@@ -1318,6 +1395,12 @@ export interface HybridSearchMeta {
    * Omitted when the gate is off. Surfaced for `gbrain search --explain`.
    */
   adaptive_return?: import('./search/return-policy.ts').AdaptiveReturnDecision;
+  /**
+   * v0.42.3.0 — autocut decision (signal, cut point, kept/total, gapRatio).
+   * Omitted when autocut didn't run (no reranker). Surfaced for
+   * `gbrain search --explain`.
+   */
+  autocut?: import('./search/autocut.ts').AutocutDecision;
   /**
    * v0.32.x (search-lite): token budget enforcement metadata. Omitted when
    * no budget was applied (backward-compatible with pre-search-lite

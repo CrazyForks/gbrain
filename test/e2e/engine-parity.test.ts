@@ -472,4 +472,50 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     expect(await pgEngine.countStalePagesForExtraction({ sourceId: SRC })).toBe(2); // sp/1 (edited) + sp/3 (NULL)
     expect(await pgliteEngine.countStalePagesForExtraction({ sourceId: SRC })).toBe(2);
   });
+
+  test('v0.41.39 listEnrichCandidates parity (thin filter + source-aware inbound + order)', async () => {
+    const stub = 'Stub page.';
+    const pageSql = `
+      INSERT INTO pages (source_id, slug, type, title, compiled_truth, timeline, frontmatter)
+        VALUES ('default', $1, $2, $3, $4, '', '{}'::jsonb)
+        ON CONFLICT (source_id, slug) DO NOTHING
+    `;
+    for (const eng of [pgEngine, pgliteEngine]) {
+      // Two thin people (ec-alice ← 2 inbound, ec-bob ← 1), one thin company
+      // (ec-widget ← 0), one long page (must be excluded by the thin filter).
+      await eng.executeRaw(pageSql, ['ep/ec-alice', 'person', 'EC Alice', stub]);
+      await eng.executeRaw(pageSql, ['ep/ec-bob', 'person', 'EC Bob', stub]);
+      await eng.executeRaw(pageSql, ['companies/ec-widget', 'company', 'EC Widget', stub]);
+      await eng.executeRaw(pageSql, ['ep/ec-long', 'person', 'EC Long', 'x'.repeat(900)]);
+      // Linker pages + inbound links (link_source NULL → counted).
+      await eng.executeRaw(pageSql, ['ep/ec-l1', 'note', 'L1', 'links']);
+      await eng.executeRaw(pageSql, ['ep/ec-l2', 'note', 'L2', 'links']);
+      await eng.executeRaw(pageSql, ['ep/ec-l3', 'note', 'L3', 'links']);
+      await eng.addLink('ep/ec-l1', 'ep/ec-alice', 'ctx a1');
+      await eng.addLink('ep/ec-l2', 'ep/ec-alice', 'ctx a2');
+      await eng.addLink('ep/ec-l3', 'ep/ec-bob', 'ctx b1');
+    }
+
+    const run = async (eng: BrainEngine) =>
+      (await eng.listEnrichCandidates({
+        types: ['person', 'company'],
+        thinThreshold: 400,
+        order: 'inbound-links',
+        limit: 10,
+        sourceId: 'default',
+      })).filter((c) => c.slug.startsWith('ep/') || c.slug === 'companies/ec-widget');
+
+    const pg = await run(pgEngine);
+    const pglite = await run(pgliteEngine);
+
+    const shape = (rows: typeof pg) => rows.map((r) => `${r.slug}:${r.inbound_count}:${r.body_len}`);
+    expect(shape(pg)).toEqual(shape(pglite));
+
+    // Concrete contract: long page excluded; ordering alice(2) > bob(1) > widget(0).
+    const slugs = pg.map((r) => r.slug);
+    expect(slugs).not.toContain('ep/ec-long');
+    expect(slugs.indexOf('ep/ec-alice')).toBeLessThan(slugs.indexOf('ep/ec-bob'));
+    expect(slugs.indexOf('ep/ec-bob')).toBeLessThan(slugs.indexOf('companies/ec-widget'));
+    expect(pg.find((r) => r.slug === 'ep/ec-alice')!.inbound_count).toBe(2);
+  });
 });
