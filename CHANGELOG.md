@@ -106,6 +106,17 @@ command, no migration.
 - New tests: `test/skillopt/rollout.test.ts`, held-out + one-shot-rewrite unit cases, and
   e2e coverage for the held-out gate (block/allow), bundled enforcement, no-mutate write,
   runtime deadline, receipt honesty, and no-DB-pollution.
+- **CLAUDE.md restructured into a thin orientation + resolver (592KB → 39KB).** The per-file
+  index, command surface, test discipline, thin-client routing, and the verbose release
+  process moved to on-demand docs (`docs/architecture/KEY_FILES.md`, `docs/TESTING.md`,
+  `docs/architecture/thin-client.md`, `docs/RELEASING.md`); CLAUDE.md keeps the North Star,
+  architecture + cross-cutting invariants, the IRON RULES, and a reference map that routes to
+  the detail. Per-file entries are now current-state only — release history lives in
+  CHANGELOG + git. `scripts/check-key-files-current-state.sh` (wired into `bun run verify`)
+  fails the build if append-only version narration returns to the reference docs or CLAUDE.md
+  grows past its cap, so the bloat cannot recur. The llms bundle drops from ~740KB to ~204KB.
+  `scripts/ci-cache-hash.sh` now keeps the relocated policy docs test-affecting so a change to
+  them still invalidates the CI cache.
 
 
 ## [0.42.8.0] - 2026-06-01
