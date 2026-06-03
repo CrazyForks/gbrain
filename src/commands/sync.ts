@@ -751,7 +751,7 @@ async function runBreakLock(
   sourceId: string,
   opts: { force: boolean; json: boolean; maxAgeSeconds?: number },
 ): Promise<number> {
-  const { inspectLock, deleteLockRow, deleteLockRowIfStale } = await import('../core/db-lock.ts');
+  const { inspectLock, deleteLockRow, deleteLockRowIfStale, classifyHolderLiveness } = await import('../core/db-lock.ts');
   const { hostname } = await import('os');
   const localHost = hostname();
   let snap;
@@ -863,18 +863,19 @@ async function runBreakLock(
     safe = true;
     reason = 'ttl_expired';
   } else {
-    // PID liveness check on local host. process.kill(pid, 0) throws ESRCH
-    // when the PID is dead. Combined with 60s age guard (per outside-voice F7).
-    let alive = true;
-    try { process.kill(snap.holder_pid, 0); }
-    catch { alive = false; }
-    const oldEnough = snap.age_ms >= 60_000;
-    if (!alive && oldEnough) {
+    // PID liveness on local host, via the shared predicate (v0.42 #1780 Gap 3).
+    // Same gate as tryAcquireDbLock's auto-takeover: same-host + provably-dead
+    // (ESRCH) + age >= 60s. EPERM is treated as ALIVE (the PID exists but isn't
+    // ours) — never break a live lock. host is already == localHost here (the
+    // cross-host branch returned above), so classify never yields 'cross_host'.
+    const liveness = classifyHolderLiveness(snap.holder_pid, snap.holder_host, snap.age_ms);
+    if (liveness === 'dead_eligible') {
       safe = true;
       reason = 'pid_dead_age_60s';
-    } else if (!alive && !oldEnough) {
+    } else if (liveness === 'too_young') {
       reason = 'pid_dead_but_lock_too_young';
     } else {
+      // 'alive' | 'unknown' | 'cross_host' (the latter unreachable here).
       reason = 'pid_alive';
     }
   }

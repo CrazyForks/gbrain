@@ -2,6 +2,53 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.14.0] - 2026-06-02
+
+**Two zero-config gaps closed: code-* queries now tell you whether the graph is built, and `gbrain init` tells you up front when your embedding key is missing.**
+
+Ask `gbrain code-callers foo` and get nothing back, and until now you had no way to know whether that meant "this symbol genuinely has no callers" or "the code graph isn't built yet." Same for `code-def`, `code-refs`, `code-callees`. An agent would see `count: 0` and confidently conclude "no callers" while the source was still indexing or had never been synced. This release adds a typed readiness field so the empty answer is honest.
+
+```
+gbrain code-callers parseMarkdown --json
+# count: 0, status: "not_built", ready: false   → no code indexed; run `gbrain sync`
+# count: 0, status: "indexing",  ready: false   → edges still resolving; retry after `gbrain dream`
+# count: 0, status: "ready",     ready: true    → genuinely no callers, trust it
+```
+
+`count: 0 + ready: true` means "genuinely none." `ready: false` means "ask later." Both the CLI and the MCP tools (`code_def`, `code_refs`, `code_callers`, `code_callees`) carry the field; human output prints a one-line hint telling you exactly what to run. `code-def`/`code-refs` are ready as soon as code is synced (their data is set at chunk time); `code-callers`/`code-callees` also report `indexing` until the call graph is resolved.
+
+**`gbrain init` now checks your embedding key before first sync.** Before, init happily saved `--embedding-model openai:...` without ever checking the key was set; then your first `gbrain sync` imported every page but embedded zero of them, and search came back empty. Now init runs a free config check (is the key present, for any provider?) plus a tiny test embed (does the key actually work?) and warns loudly if either fails:
+
+```
+Heads up: embedding is configured but not ready.
+Model "openai:text-embedding-3-large" needs OPENAI_API_KEY — not set in your shell or ~/.gbrain/config.json.
+```
+
+Init still exits 0 so deferred setup keeps working. The check correctly sees keys set in `~/.gbrain/config.json` (not just the shell), and `--no-embedding` or the new `--skip-embed-check` skip it.
+
+**Crashed cycle locks self-heal faster.** If a `gbrain dream`/sync process crashed while holding the cycle lock, the next run waited out the full 30-minute TTL. Now, when the dead holder is on the same machine and provably gone, the lock is reclaimed automatically after a 60-second grace (a guard against PID reuse). Cross-host locks stay TTL-only. `gbrain sync --break-lock` got the same liveness fix — it no longer treats a permission-denied probe (a live process you don't own) as dead.
+
+## To take advantage of v0.42.14.0
+
+`gbrain upgrade` handles everything — no schema migration in this release.
+
+1. **Readiness:** `gbrain code-callers <symbol> --json` and read the new `status` / `ready` fields. `ready: false` means wait and retry; `ready: true` with `count: 0` means genuinely none.
+2. **Init check:** next time you run `gbrain init` with an embedding model, a missing or invalid key warns immediately. Set the key and re-run `gbrain sync`, or pass `--no-embedding` to defer.
+3. **Lock self-heal is automatic** — nothing to configure.
+
+If anything looks off, file an issue with the output of `gbrain doctor`: https://github.com/garrytan/gbrain/issues
+
+### Itemized changes
+
+- **`src/core/code-graph-readiness.ts` (new)** — `resolveCodeReadiness(engine, {kind, count, sourceId?, allSources?})` returns `{status: 'not_built' | 'indexing' | 'ready' | 'unknown', ready, has_code, pending_edges}`. `count > 0` short-circuits to `ready` with no query; on empty it runs `EXISTS` probes (no `page_kind` index needed; the pending probe rides the partial `idx_content_chunks_edges_backfill`). `kind: 'symbol'` (code-def/refs) is 2-state and brain-wide; `kind: 'edge'` (callers/callees) is 3-state and source-scoped, with the pending predicate mirroring the resolver (`edges_backfilled_at IS NULL OR < EDGE_EXTRACTOR_VERSION_TS`) so a resolver-version bump doesn't falsely report `ready`. Scope matches the result query's `deleted_at` posture; any DB error returns `unknown` (fail-open). `readinessHint()` renders the human one-liner.
+- **`src/commands/code-def.ts`, `code-refs.ts`, `code-callers.ts`, `code-callees.ts`** — each JSON envelope gains `status` + `ready`; human output prints the hint when not ready. callers/callees pass their resolved `sourceId` / `allSources`; def/refs query brain-wide.
+- **`src/core/operations.ts`** — the four `code_*` MCP op handlers stamp `status` + `ready` on their result envelopes.
+- **`src/core/init-embed-check.ts` (new)** — `runInitEmbedCheck()` builds the effective env (process.env + file-plane `openai/anthropic/zeroentropy_api_key` + `--key`), reconfigures the gateway via `buildGatewayConfig`, runs `diagnoseEmbedding` (config-only), then a best-effort `liveTestEmbed` (1 token, 5s `AbortController` timeout, never throws). Init-specific warning names `--no-embedding` / `--skip-embed-check`.
+- **`src/core/ai/build-gateway-config.ts` (new)** — `buildGatewayConfig` extracted from `src/cli.ts` (which now re-exports it) so core modules reuse it without importing the CLI entrypoint. Folds file-plane API keys + provider base URLs into the gateway config; `process.env` wins.
+- **`src/commands/init.ts`** — new `--skip-embed-check` flag (also `GBRAIN_INIT_SKIP_EMBED_CHECK=1`); replaces the prior ZeroEntropy-only warning in both the PGLite and Postgres paths with the generalized check; `embedding_check {ok, reason?, live_ok?}` added to the `--json` success envelope; help text updated.
+- **`src/core/db-lock.ts`** — `tryAcquireDbLock` adds same-host dead-pid auto-takeover (guarded `DELETE WHERE id=$1 AND holder_pid=$2` + one normal-upsert retry returning the standard handle). New exported `classifyHolderLiveness` / `isHolderDeadLocally` (injectable `process.kill` seam; `HOLDER_TAKEOVER_GRACE_MS = 60_000`; EPERM classified as `alive`, never reclaimed). TTL-expired locks stay the upsert's job; cross-host stays TTL-only.
+- **`src/commands/sync.ts`** — `runBreakLock`'s safe path consumes the shared `classifyHolderLiveness` predicate, fixing the prior bug where any `process.kill` throw (including EPERM) counted the holder as dead.
+- **Tests** — `test/code-graph-readiness.test.ts` (11), `test/db-lock-auto-takeover.test.ts` (11), `test/init-embed-check.test.ts` (9, hermetic via the gateway embed-transport seam + `withEnv`), plus readiness-envelope cases added to `test/e2e/code-intel-mcp-ops-pglite.test.ts`. Closes #1780.
 ## [0.42.13.0] - 2026-06-02
 
 **Pages under `archive/` are findable again.** If you committed a note to your brain under `archive/` (old conversation exports, prior-system logs, notes you filed away), GBrain was embedding it and graphing it but then hiding it from every search. You would search for an exact phrase you knew was in the page, get nothing back, and conclude the page did not exist. It did. A hardcoded list was quietly dropping the whole `archive/` subtree from results unless you knew to pass a special flag.

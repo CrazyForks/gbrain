@@ -4006,3 +4006,27 @@ Start at `probeChatModel` in `src/core/ai/gateway.ts` and the explicit gate in
 
 **Depends on:** a config-independent provider-general key probe (new gateway
 helper) so the `isAvailable` unconfigured-gateway false-reject footgun is avoided.
+
+## v0.42.14.0 follow-ups (#1780)
+
+### Unify the init live-test-embed with the models-doctor reachability probe
+**Priority:** P3
+
+**What:** `src/core/init-embed-check.ts:liveTestEmbed` and
+`src/commands/models.ts:probeEmbeddingReachability` both do the same thing —
+a 1-token `gateway.embed(['probe'], {inputType:'query', abortSignal})` with a 5s
+timeout + error classification. They were left as two small implementations
+because `probeEmbeddingReachability` is private and returns the doctor-shaped
+`ProbeResult`, while the init path wants `{ok, reason, message}`.
+
+**Why:** rule-of-three is met (init check + models doctor + the classifyError
+duplication). One shared embed-probe core would prevent the two from drifting
+on timeout/classification behavior.
+
+**How to start:** extract the embed + AbortController-timeout + error-classify
+core into a shared helper (e.g. `src/core/ai/embed-probe.ts`), have both
+`liveTestEmbed` and `probeEmbeddingReachability` adapt its result to their
+respective shapes. Small, mechanical; pinned by `test/init-embed-check.test.ts`
++ the models-doctor tests.
+
+**Depends on:** nothing.
