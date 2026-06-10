@@ -248,7 +248,9 @@ export class PostgresEngine implements BrainEngine {
       this.connectionManager = null;
     }
     if (this._sql) {
-      await this._sql.end();
+      // #1972: gbrain-owned hard bound so a PgBouncer drain that never settles
+      // can't block teardown until the CLI's 10s force-exit truncates stdout.
+      await db.endPoolBounded(this._sql);
       this._sql = null;
       // After this point, _connectionStyle stays 'instance' so a second
       // disconnect() is a no-op rather than falling through and clearing
@@ -895,13 +897,21 @@ export class PostgresEngine implements BrainEngine {
   }
 
   // Pages CRUD
-  async getPage(slug: string, opts?: { sourceId?: string; includeDeleted?: boolean }): Promise<Page | null> {
+  async getPage(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<Page | null> {
     const sql = this.sql;
     const includeDeleted = opts?.includeDeleted === true;
     const sourceId = opts?.sourceId;
-    // v0.26.5: default hides soft-deleted rows. Compose with optional sourceId
+    const sourceIds = opts?.sourceIds;
+    // v0.26.5: default hides soft-deleted rows. Compose with optional source
     // filter via fragment chaining (postgres.js supports sql`` composition).
-    const sourceCondition = sourceId ? sql`AND source_id = ${sourceId}` : sql``;
+    // #1393: a federated grant (sourceIds[]) takes precedence over scalar
+    // sourceId so the exact-match read honors allowedSources, not just one source.
+    const sourceCondition =
+      sourceIds && sourceIds.length > 0
+        ? sql`AND source_id = ANY(${sourceIds}::text[])`
+        : sourceId
+          ? sql`AND source_id = ${sourceId}`
+          : sql``;
     const deletedCondition = includeDeleted ? sql`` : sql`AND deleted_at IS NULL`;
     const rows = await sql`
       SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
@@ -4847,9 +4857,26 @@ export class PostgresEngine implements BrainEngine {
 
   // Config
   async getConfig(key: string): Promise<string | null> {
-    const sql = this.sql;
-    const rows = await sql`SELECT value FROM config WHERE key = ${key}`;
-    return rows.length > 0 ? (rows[0].value as string) : null;
+    // #1603: a transient pooler drop on this read used to throw / fall through
+    // to defaults silently — which on remote Postgres surfaces as the wrong
+    // search mode/knobs and empty-stdout queries. Retry-with-reconnect using the
+    // same tuned opts as the bulk writers. No auditSite: this is a single-row
+    // read, not a bulk write, so it must not emit batch-retry audit rows.
+    // `this.sql` is a getter, so each attempt sees the pool rebuilt by reconnect.
+    const opts = this.getBulkRetryOpts();
+    return withRetry(
+      async () => {
+        const rows = await this.sql`SELECT value FROM config WHERE key = ${key}`;
+        return rows.length > 0 ? (rows[0].value as string) : null;
+      },
+      {
+        maxRetries: opts.maxRetries,
+        delayMs: opts.delayMs,
+        delayMaxMs: opts.delayMaxMs,
+        jitter: BULK_RETRY_OPTS.jitter,
+        reconnect: (ctx) => this.reconnect(ctx),
+      },
+    );
   }
 
   async setConfig(key: string, value: string): Promise<void> {

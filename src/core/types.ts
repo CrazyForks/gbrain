@@ -330,6 +330,12 @@ export interface PageFilters {
 export interface GetPageOpts {
   /** Filter to a specific source. When omitted, getPage returns the first slug match across sources (pre-existing semantics). */
   sourceId?: string;
+  /**
+   * Filter to a federated set of sources (the caller's allowedSources grant).
+   * Takes precedence over `sourceId` when non-empty. Closes the #1393 leak: the
+   * get_page exact path must honor a federated grant, not just scalar sourceId.
+   */
+  sourceIds?: string[];
   /** Include soft-deleted pages. Default false. See PageFilters.includeDeleted. */
   includeDeleted?: boolean;
 }
