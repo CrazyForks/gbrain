@@ -295,13 +295,19 @@ export class PGLiteEngine implements BrainEngine {
   /**
    * #2034: engine-parity reconnect. PGLite is single-writer in-process so it
    * doesn't suffer the pool-drop class PostgresEngine.reconnect() handles, but
-   * the method MUST exist so callers (autopilot health probe) can use
-   * `engine.reconnect()` uniformly instead of `disconnect()` + bare `connect()`
-   * (which would throw on the lost config). Tears the handle down and
-   * re-opens against the config captured at the last connect().
+   * the method MUST exist so callers (autopilot health probe, worker/queue
+   * claim-error recovery) can call `engine.reconnect()` uniformly.
+   *
+   * IN-MEMORY (no `database_path`) is a NO-OP: there is no persistent backing,
+   * the connection can't recoverably "drop" in-process, and a disconnect+reopen
+   * would DISCARD all state. This matches the long-standing assumption the
+   * worker/queue recovery paths are written against ("PGLite has no pooler
+   * reaping so reconnect is absent" — src/core/minions/queue.ts). A FILE-backed
+   * engine genuinely re-opens the same data dir (state persists on disk).
    */
   async reconnect(_ctx?: { error?: unknown }): Promise<void> {
     if (!this._savedConfig) return; // never connected — nothing to restore
+    if (!this._savedConfig.database_path) return; // in-memory — no-op, preserve state
     const config = this._savedConfig;
     await this.disconnect();
     await this.connect(config);
