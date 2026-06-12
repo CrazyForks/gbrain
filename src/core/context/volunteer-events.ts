@@ -18,6 +18,7 @@
  */
 
 import type { BrainEngine } from './../engine.ts';
+import { registerBackgroundWorkDrainer } from '../background-work.ts';
 
 export const VOLUNTEER_EVENTS_TTL_DAYS = 90;
 
@@ -68,6 +69,73 @@ export async function insertVolunteerEvents(
      VALUES ${tuples.join(', ')}`,
     params,
   );
+}
+
+// ── Fire-and-forget sink (eng-review D4) ─────────────────────────────────
+// Mirrors src/core/last-retrieved.ts: track every dangling INSERT promise in
+// a module Set, register a drainer so drainThenDisconnect settles them
+// against a live engine before teardown on EVERY CLI exit path (the commit-1
+// drain hoist). Logging failure never fails the caller.
+
+const pendingVolunteerEventWrites = new Set<Promise<unknown>>();
+
+/**
+ * Log volunteered pages without blocking the hot path. The batched INSERT
+ * runs as a tracked dangling promise; errors are swallowed (pre-v116 brains,
+ * transient DB failures — the volunteer result is unaffected).
+ */
+export function logVolunteerEventsFireAndForget(
+  engine: BrainEngine,
+  rows: VolunteerEventRow[],
+): void {
+  if (!rows.length) return;
+  const p = insertVolunteerEvents(engine, rows).catch(() => {
+    /* best-effort telemetry — never surfaces */
+  });
+  pendingVolunteerEventWrites.add(p);
+  void p.finally(() => pendingVolunteerEventWrites.delete(p));
+}
+
+/** Drain pending event writes (bounded). Same snapshot semantics as last-retrieved. */
+export async function awaitPendingVolunteerEventWrites(
+  timeoutMs = 5_000,
+): Promise<{ unfinished: number }> {
+  if (pendingVolunteerEventWrites.size === 0) return { unfinished: 0 };
+  const snapshot = Array.from(pendingVolunteerEventWrites);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs);
+  });
+  const drain = Promise.allSettled(snapshot).then(() => 'drained' as const);
+  const outcome = await Promise.race([drain, timeout]);
+  if (timer) clearTimeout(timer);
+  if (outcome === 'timeout') {
+    const unfinished = pendingVolunteerEventWrites.size;
+    // Drop the snapshot so a long-lived process (`gbrain watch`) doesn't
+    // accumulate references to forever-pending work (last-retrieved C1).
+    for (const p of snapshot) pendingVolunteerEventWrites.delete(p);
+    return { unfinished };
+  }
+  return { unfinished: 0 };
+}
+
+// Registered in the enqueue-owning module (background-work contract): module
+// not imported ⇒ nothing enqueued ⇒ nothing to drain. Order 4 — after facts /
+// last-retrieved / search-cache / eval-capture; bare INSERTs, no abort.
+registerBackgroundWorkDrainer({
+  name: 'volunteer-events',
+  order: 4,
+  drain: (ms) => awaitPendingVolunteerEventWrites(ms),
+});
+
+/** Test seam — clears the pending set so each test starts clean. */
+export function _resetPendingVolunteerEventWritesForTests(): void {
+  pendingVolunteerEventWrites.clear();
+}
+
+/** Test seam — peek the current pending count. */
+export function _peekPendingVolunteerEventWritesForTests(): number {
+  return pendingVolunteerEventWrites.size;
 }
 
 /**

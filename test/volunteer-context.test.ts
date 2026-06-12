@@ -281,3 +281,115 @@ describe('resolveEntitiesToPointers — new provenance surface (back-compat)', (
     expect(block).toBeNull();
   });
 });
+
+describe('volunteer_context op (contract surface)', () => {
+  const { operationsByName } = require('../src/core/operations.ts') as typeof import('../src/core/operations.ts');
+  const {
+    awaitPendingVolunteerEventWrites,
+    _resetPendingVolunteerEventWritesForTests,
+  } = require('../src/core/context/volunteer-events.ts') as typeof import('../src/core/context/volunteer-events.ts');
+
+  function mkCtx(overrides: Record<string, unknown> = {}) {
+    return {
+      engine,
+      config: {} as never,
+      logger: { info: () => {}, warn: () => {}, error: () => {} } as never,
+      dryRun: false,
+      remote: false,
+      sourceId: 'default',
+      ...overrides,
+    } as never;
+  }
+
+  test('registered, read-scope, not localOnly, stdin cliHint on window', () => {
+    const op = operationsByName.volunteer_context;
+    expect(op).toBeDefined();
+    expect(op.scope).toBe('read');
+    expect(op.localOnly).toBeFalsy();
+    expect(op.cliHints?.name).toBe('volunteer-context');
+    expect(op.cliHints?.stdin).toBe('window');
+  });
+
+  test('window required unless stats: true', async () => {
+    const op = operationsByName.volunteer_context;
+    await expect(op.handler(mkCtx(), {})).rejects.toThrow(/window is required/);
+    const stats = (await op.handler(mkCtx(), { stats: true })) as any;
+    expect(stats.approximate).toBe(true);
+  });
+
+  test('volunteers pages and logs events through the drained sink', async () => {
+    _resetPendingVolunteerEventWritesForTests();
+    await seed('people/alice-example', 'Alice Example', 'Founder.');
+    const op = operationsByName.volunteer_context;
+    const result = (await op.handler(mkCtx(), {
+      window: 'user: ping Alice Example about the deal',
+      session_id: 's-42',
+      turn: 7,
+    })) as any;
+    expect(result.count).toBe(1);
+    expect(result.pages[0].slug).toBe('people/alice-example');
+    expect(result.window_turns).toBe(1);
+    // Event row lands via the fire-and-forget sink once drained.
+    const { unfinished } = await awaitPendingVolunteerEventWrites(5_000);
+    expect(unfinished).toBe(0);
+    const rows = await engine.executeRaw<{ slug: string; channel: string; session_id: string; turn: number }>(
+      `SELECT slug, channel, session_id, turn FROM context_volunteer_events`, [],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].slug).toBe('people/alice-example');
+    expect(rows[0].channel).toBe('op');
+    expect(rows[0].session_id).toBe('s-42');
+    expect(Number(rows[0].turn)).toBe(7);
+  });
+
+  test('event-log failure never fails the op (failing engine injected for the INSERT)', async () => {
+    _resetPendingVolunteerEventWritesForTests();
+    await seed('people/alice-example', 'Alice Example', 'Founder.');
+    const op = operationsByName.volunteer_context;
+    // Wrap the engine: reads pass through, INSERTs into the events table throw.
+    const failingEngine = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return (sql: string, params: unknown[]) => {
+            if (/INSERT INTO context_volunteer_events/.test(sql)) {
+              return Promise.reject(new Error('telemetry db down'));
+            }
+            return target.executeRaw(sql, params);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const result = (await op.handler(mkCtx({ engine: failingEngine }), {
+      window: 'user: ping Alice Example',
+    })) as any;
+    expect(result.count).toBe(1); // the volunteer result is unaffected
+    const { unfinished } = await awaitPendingVolunteerEventWrites(5_000);
+    expect(unfinished).toBe(0); // failed write settled (swallowed), not stuck
+  });
+
+  test('federated grant scopes the volunteer (allowedSources)', async () => {
+    await seed('people/alice-example', 'Alice Example', 'Founder.', 'default');
+    await seed('people/bob-sample', 'Bob Sample', 'Engineer.', 'grant-brain');
+    await seed('people/eve-other', 'Eve Other', 'Out of grant.', 'secret-brain');
+    const op = operationsByName.volunteer_context;
+    const result = (await op.handler(
+      mkCtx({ remote: true, auth: { allowedSources: ['grant-brain'] } }),
+      { window: 'user: intro Alice Example to Bob Sample and Eve Other' },
+    )) as any;
+    expect(result.pages.map((p: any) => p.slug)).toEqual(['people/bob-sample']);
+  });
+
+  test('stats mode is source-scoped and returns the approximate note', async () => {
+    await seed('people/alice-example', 'Alice Example', 'Founder.');
+    await insertVolunteerEvents(engine, [
+      { source_id: 'default', slug: 'people/alice-example', confidence: 0.9, match_arm: 'alias', rationale: 'r', channel: 'watch' },
+    ]);
+    const op = operationsByName.volunteer_context;
+    const stats = (await op.handler(mkCtx(), { stats: true, days: 7 })) as any;
+    expect(stats.days).toBe(7);
+    expect(stats.total_volunteered).toBe(1);
+    expect(stats.by_arm[0].channel).toBe('watch');
+    expect(stats.note).toContain('approximate');
+  });
+});

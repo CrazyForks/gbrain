@@ -788,6 +788,27 @@ async function makeContext(engine: BrainEngine, params: Record<string, unknown>)
 
 function formatResult(opName: string, result: unknown): string {
   switch (opName) {
+    case 'volunteer_context': {
+      const r = result as any;
+      // Stats mode (the feedback loop).
+      if (r && r.approximate === true && Array.isArray(r.by_arm)) {
+        const lines = [
+          `volunteered-context precision — last ${r.days} day(s) (${r.note})`,
+          `total: ${r.total_volunteered} volunteered, ${r.total_used} used`,
+        ];
+        for (const a of r.by_arm) {
+          lines.push(`  ${a.match_arm}/${a.channel}: ${a.used}/${a.volunteered} used (precision ${a.precision})`);
+        }
+        if (!r.by_arm.length) lines.push('  (no volunteer events in the window)');
+        return lines.join('\n') + '\n';
+      }
+      const pages = (r?.pages ?? []) as any[];
+      if (!pages.length) return 'Nothing volunteered (no entity cleared the confidence gate).\n';
+      return pages.map((p) =>
+        `${p.display} → ${p.slug} (${p.confidence.toFixed(2)}, ${p.arm}) — ${p.rationale}` +
+        (p.synopsis ? `\n    ${p.synopsis}` : ''),
+      ).join('\n') + '\n';
+    }
     case 'get_page': {
       const r = result as any;
       if (r.error === 'ambiguous_slug') {
