@@ -36,6 +36,20 @@ function baseConfig(overrides: Partial<AIGatewayConfig> = {}): AIGatewayConfig {
   };
 }
 
+describe('formatEmbeddingCredsError — user_provided_dims_unset (#1292/D6)', () => {
+  test('names the dimension fix, not a model fix', () => {
+    const msg = formatEmbeddingCredsError({
+      ok: false,
+      reason: 'user_provided_dims_unset',
+      model: 'litellm:bge-large',
+      provider: 'litellm',
+      recipeId: 'litellm',
+    });
+    expect(msg).toMatch(/dimension/i);
+    expect(msg).toMatch(/embedding_dimensions/);
+  });
+});
+
 describe('validateEmbeddingCreds', () => {
   beforeEach(() => { resetGateway(); });
 
