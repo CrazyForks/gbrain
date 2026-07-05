@@ -108,12 +108,15 @@ async function seedPage(opts: {
 }
 
 describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
-  test('filters by all 6 extractable types', async () => {
-    for (const type of ['meeting', 'source', 'article', 'video', 'book', 'original']) {
+  test('discovers legacy + pack-extractable types, excludes synthesis outputs', async () => {
+    // Legacy floor + `note` (declared extractable:true in gbrain-base, now
+    // honored via the pack manifest — the D2 fix).
+    for (const type of ['meeting', 'source', 'article', 'video', 'book', 'original', 'note']) {
       await seedPage({ slug: `${type}/x`, type });
     }
-    // Add a non-extractable page that should NOT appear
-    await seedPage({ slug: 'notes/skip-me', type: 'note' });
+    // `concept` is also extractable:true in gbrain-base, but extracting atoms
+    // FROM concepts would loop — synthesis outputs are always excluded.
+    await seedPage({ slug: 'wiki/concepts/skip-me', type: 'concept' });
 
     const discovered = await discoverExtractablePages(engine, 'default');
     const slugs = discovered.map((d) => d.slug).sort();
@@ -121,6 +124,7 @@ describe('v0.41.2.1: discoverExtractablePages SQL contract', () => {
       'article/x',
       'book/x',
       'meeting/x',
+      'note/x',
       'original/x',
       'source/x',
       'video/x',

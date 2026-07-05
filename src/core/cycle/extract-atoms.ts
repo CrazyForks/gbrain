@@ -61,15 +61,55 @@ const ATOM_TYPES = [
   'critique', 'collection',
 ] as const;
 
-// v0.41.2.1 (D2): brain-page discovery constants. Hardcoded for now;
-// future pack-aware refactor is a one-line change to pull from the
-// active pack manifest (symmetric with the existing
-// src/core/facts/eligibility.ts:49 TODO).
-const EXTRACTABLE_PAGE_TYPES = [
+// v0.41.2.1 (D2): brain-page discovery constants.
+//
+// Legacy floor: the pre-pack hardcoded atom-extraction types. Retained as a
+// back-compat union member so a gbrain-base brain never loses an extraction
+// target when we begin honoring the pack manifest's `extractable` flags.
+const LEGACY_EXTRACTABLE_TYPES = [
   'meeting', 'source', 'article', 'video', 'book', 'original',
 ] as const;
+
+// Synthesis outputs are never extraction inputs: extracting atoms from atoms or
+// concepts would loop (concepts are synthesized FROM atoms). Mirrors
+// facts/eligibility.ts, which likewise excludes `concept` despite its
+// extractable:true flag being a documented forward-compat marker.
+const SYNTHESIS_OUTPUT_TYPES = new Set<string>(['atom', 'concept']);
+
 const PAGE_DISCOVERY_BUDGET = 50;
 const MIN_PAGE_CHARS_FOR_EXTRACTION = 500;
+
+/**
+ * Pure allowlist policy: the legacy floor UNION the pack's `extractable: true`
+ * types, MINUS synthesis outputs. Exported for unit tests; keep I/O-free.
+ */
+export function unionExtractableTypes(packExtractable: Iterable<string>): string[] {
+  const types = new Set<string>(LEGACY_EXTRACTABLE_TYPES);
+  for (const t of packExtractable) types.add(t);
+  for (const t of SYNTHESIS_OUTPUT_TYPES) types.delete(t);
+  return [...types];
+}
+
+/**
+ * Resolve the atom-extraction type allowlist from the active schema pack.
+ * Closes the D2 TODO of honoring the pack manifest (so a type declared
+ * extractable — e.g. `note` — actually extracts) while preserving behavior for
+ * gbrain-base via the legacy-floor union. Fail-soft: any pack-load error falls
+ * back to the legacy floor.
+ */
+async function resolveExtractableTypes(): Promise<string[]> {
+  let packExtractable: Iterable<string> = [];
+  try {
+    const { loadConfig } = await import('../config.ts');
+    const { loadActivePack } = await import('../schema-pack/load-active.ts');
+    const { extractableTypesFromPack } = await import('../schema-pack/extractable.ts');
+    const resolved = await loadActivePack({ cfg: loadConfig(), remote: false });
+    packExtractable = extractableTypesFromPack(resolved.manifest);
+  } catch {
+    // Pack unavailable (test seams, bootstrap) — legacy floor only.
+  }
+  return unionExtractableTypes(packExtractable);
+}
 
 export interface ExtractAtomsOpts {
   brainDir?: string;
@@ -195,7 +235,7 @@ export async function discoverExtractablePages(
   `;
   const params: unknown[] = [
     sourceId,
-    EXTRACTABLE_PAGE_TYPES as unknown as string[],
+    await resolveExtractableTypes(),
     MIN_PAGE_CHARS_FOR_EXTRACTION,
     PAGE_DISCOVERY_BUDGET,
   ];
@@ -272,9 +312,10 @@ export async function countExtractAtomsBacklog(
                AND atom.frontmatter->>'source_hash' = substring(p.content_hash from 1 for 16)
                AND atom.deleted_at IS NULL
            )`;
+    const extractableTypes = await resolveExtractableTypes();
     const params = scoped
-      ? [sourceId, EXTRACTABLE_PAGE_TYPES as unknown as string[], MIN_PAGE_CHARS_FOR_EXTRACTION]
-      : [EXTRACTABLE_PAGE_TYPES as unknown as string[], MIN_PAGE_CHARS_FOR_EXTRACTION];
+      ? [sourceId, extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION]
+      : [extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION];
     const rows = await engine.executeRaw<{ cnt: string | number }>(sql, params);
     return Number(rows[0]?.cnt ?? 0);
   } catch (err) {
