@@ -90,6 +90,26 @@ export function resolveBootstrapToken(
   return { kind: 'ok', token: trimmed, fromEnv: true };
 }
 
+/**
+ * #2624: decide whether the generated admin bootstrap token is hidden from
+ * the startup banner. Fail-safe default: a generated token is NOT printed
+ * unless stderr is an interactive TTY, so containerized (non-TTY) deploys
+ * never ship the secret to centralized log storage. Env-sourced tokens are
+ * always hidden (operator already holds them). Explicit --suppress hides
+ * everything; --print-admin-token forces the raw value even on a non-TTY.
+ */
+export function shouldSuppressBootstrapPrint(opts: {
+  suppress: boolean;
+  fromEnv: boolean;
+  forcePrint: boolean;
+  isTty: boolean;
+}): boolean {
+  if (opts.suppress) return true;
+  if (opts.fromEnv) return true;
+  if (opts.forcePrint) return false;
+  return !opts.isTty;
+}
+
 export type ProbeHealthResult =
   | { ok: true; status: 200; body: { status: 'ok'; version: string; engine: string; [k: string]: unknown } }
   | { ok: false; status: 503; body: { error: 'service_unavailable'; error_description: string } };
@@ -304,6 +324,14 @@ interface ServeHttpOptions {
    * tracking the regenerated value through other means.
    */
   suppressBootstrapToken?: boolean;
+  /**
+   * #2624: force-print the generated admin bootstrap token even on a
+   * non-TTY (containerized) start. By default the raw token is only printed
+   * when stderr is an interactive TTY, so it never lands in centralized log
+   * storage for headless deploys. Set this when you genuinely need the value
+   * captured to a non-interactive log and accept the leak.
+   */
+  printAdminToken?: boolean;
 }
 
 /**
@@ -530,7 +558,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   let bootstrapToken: string = resolved.token;
   let bootstrapFromEnv: boolean = resolved.fromEnv;
   const bootstrapHash = createHash('sha256').update(bootstrapToken).digest('hex');
-  const suppressBootstrapPrint = options.suppressBootstrapToken === true;
+  const suppressBootstrapPrint = shouldSuppressBootstrapPrint({
+    suppress: options.suppressBootstrapToken === true,
+    fromEnv: bootstrapFromEnv,
+    forcePrint: options.printAdminToken === true,
+    isTty: process.stderr.isTTY === true,
+  });
   const adminSessions = new Map<string, number>(); // sessionId → expiresAt
 
   // SSE clients for live activity feed
@@ -2167,7 +2200,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 ║  Health:    http://localhost:${port}/health${' '.repeat(Math.max(0, 18 - String(port).length))}║
 ╠══════════════════════════════════════════════════════╣
 ${suppressBootstrapPrint
-  ? '║  Admin Token: suppressed (--suppress-bootstrap-token) ║\n╚══════════════════════════════════════════════════════╝'
+  ? '║  Admin Token: hidden (non-TTY log-leak guard)        ║\n║  set $GBRAIN_ADMIN_BOOTSTRAP_TOKEN, or pass          ║\n║  --print-admin-token on a trusted terminal.          ║\n╚══════════════════════════════════════════════════════╝'
   : bootstrapFromEnv
     ? '║  Admin Token: from $GBRAIN_ADMIN_BOOTSTRAP_TOKEN     ║\n╚══════════════════════════════════════════════════════╝'
     : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`}
