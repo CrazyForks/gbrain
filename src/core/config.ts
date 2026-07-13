@@ -41,6 +41,13 @@ export interface GBrainConfig {
    * merge → buildGatewayConfig env dict → recipe reads ZEROENTROPY_API_KEY.
    */
   zeroentropy_api_key?: string;
+  /**
+   * OpenRouter API key. File-plane slot so `gbrain config set
+   * openrouter_api_key X` (or config.json) reaches the openrouter recipe:
+   * file plane → loadConfig env merge → buildGatewayConfig env dict → recipe
+   * reads OPENROUTER_API_KEY.
+   */
+  openrouter_api_key?: string;
   /** AI gateway config (v0.14+). v0.36+ default: "zeroentropyai:zembed-1" / 1280 / "anthropic:claude-haiku-4-5-20251001". */
   embedding_model?: string;
   embedding_dimensions?: number;
@@ -526,6 +533,7 @@ export function loadConfig(): GBrainConfig | null {
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
     ...(process.env.ANTHROPIC_API_KEY ? { anthropic_api_key: process.env.ANTHROPIC_API_KEY } : {}),
     ...(process.env.ZEROENTROPY_API_KEY ? { zeroentropy_api_key: process.env.ZEROENTROPY_API_KEY } : {}),
+    ...(process.env.OPENROUTER_API_KEY ? { openrouter_api_key: process.env.OPENROUTER_API_KEY } : {}),
     ...(process.env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: process.env.GBRAIN_EMBEDDING_MODEL } : {}),
     ...(process.env.GBRAIN_EMBEDDING_DIMENSIONS ? { embedding_dimensions: parseInt(process.env.GBRAIN_EMBEDDING_DIMENSIONS, 10) } : {}),
     ...(process.env.GBRAIN_EXPANSION_MODEL ? { expansion_model: process.env.GBRAIN_EXPANSION_MODEL } : {}),
@@ -815,6 +823,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'database_path',
   'openai_api_key',
   'anthropic_api_key',
+  'zeroentropy_api_key',
+  'openrouter_api_key',
   'embedding_model',
   'embedding_dimensions',
   'embedding_disabled',
@@ -836,6 +846,11 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'sync',
   'sync.repo_path',
   'sync.last_commit',
+  // Gateway-native subagent loop toggle (routes subagent jobs through the
+  // provider-agnostic gateway.toolLoop for non-Anthropic providers). The
+  // subagent handler's error message tells users to `config set` this, so it
+  // must be a known key or `config set` rejects it without --force.
+  'agent.use_gateway_loop',
   // DB-plane (v0.32.3 search modes + related)
   'search.mode',
   'search.cache.enabled',
