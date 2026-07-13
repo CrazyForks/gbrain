@@ -1022,17 +1022,36 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     // loop. Probe runs even when cycleOk=false (probe may surface signal
     // explaining why the cycle is failing).
     try {
-      const probeEnabled = cfg?.autopilot?.nightly_quality_probe?.enabled === true;
+      const { resolveProbeEnabled, resolveProbeMaxUsd, runNightlyQualityProbe } = await import('../core/cycle/nightly-quality-probe.ts');
+      // Dual-plane read: `gbrain config set` (what the doctor enable hint
+      // prints) writes the DB plane; ~/.gbrain/config.json is the fallback.
+      let dbEnabled: string | null = null;
+      let dbMaxUsd: string | null = null;
+      try {
+        dbEnabled = await engine.getConfig('autopilot.nightly_quality_probe.enabled');
+        dbMaxUsd = await engine.getConfig('autopilot.nightly_quality_probe.max_usd');
+      } catch { /* DB unavailable → file plane only */ }
+      const probeEnabled = resolveProbeEnabled(dbEnabled, cfg?.autopilot?.nightly_quality_probe?.enabled);
       if (probeEnabled) {
-        const { runNightlyQualityProbe } = await import('../core/cycle/nightly-quality-probe.ts');
         const { runLongMemEvalForProbe, runCrossModalBatchForProbe } = await import('../core/cycle/nightly-probe-adapters.ts');
         const { isAvailable } = await import('../core/ai/gateway.ts');
-        const maxUsd = Number(cfg?.autopilot?.nightly_quality_probe?.max_usd ?? 5);
+        const { existsSync } = await import('node:fs');
+        const { fileURLToPath } = await import('node:url');
+        const { join } = await import('node:path');
+        const maxUsd = resolveProbeMaxUsd(dbMaxUsd, cfg?.autopilot?.nightly_quality_probe?.max_usd);
+        // The committed fixture (test/fixtures/longmemeval-nightly.jsonl)
+        // lives in the gbrain PACKAGE, not the brain repo — repoPath is
+        // sync.repo_path (the user's brain), where the fixture never
+        // exists, so the probe error'd on every real install. Resolve the
+        // package root from the module location; keep repoPath as the
+        // fallback for setups that vendor the fixture into the brain repo.
+        const pkgRoot = fileURLToPath(new URL('../..', import.meta.url));
+        const fixtureAtPkgRoot = existsSync(join(pkgRoot, 'test', 'fixtures', 'longmemeval-nightly.jsonl'));
         await runNightlyQualityProbe({
           isEnabled: () => true, // already gated above; phase re-checks for defense-in-depth
           hasEmbeddingProvider: () => isAvailable('embedding'),
           resolveMaxUsd: () => maxUsd,
-          resolveRepoRoot: () => repoPath ?? gbrainHomePath('.'),
+          resolveRepoRoot: () => (fixtureAtPkgRoot ? pkgRoot : repoPath ?? gbrainHomePath('.')),
           runLongMemEval: runLongMemEvalForProbe,
           runCrossModalBatch: runCrossModalBatchForProbe,
           now: () => new Date(),
