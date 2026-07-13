@@ -1,5 +1,54 @@
 # TODOS
 
+## v0.42.59.0 follow-ups (five-fix rollup #2735–#2739)
+
+Filed as follow-ups from v0.42.59.0 (bootstrap probe for
+`timeline_entries.event_page_id`, migrate-engine source catalog + target-aware
+resume, entity-resolution quarantine, escape-aware fence cells, think gather
+source scope).
+
+- [ ] **P2 — schema-bootstrap-coverage strip block never exercises `timeline_entries.event_page_id`.**
+  The guard's pre-migration-brain simulation (the strip DDL in
+  `test/schema-bootstrap-coverage.test.ts`) has no
+  `ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id` (or FK drop), so the
+  coverage entry added for the v121 forward reference is vacuous — the probe never fires
+  under that harness. The real regression guard lives in `test/bootstrap.test.ts` (which
+  does drop → re-bootstrap → assert). Add the DROP statements to the strip block so the
+  coverage test genuinely exercises its own entry.
+- [ ] **P2 — extract-facts reconcile still wipes-then-reinserts when the parse emitted MALFORMED warnings.**
+  `runExtractFacts` (`src/core/cycle/extract-facts.ts`) deletes a page's facts and
+  reinserts from the parsed fence even when `parseFactsFence` surfaced
+  `FACTS_TABLE_MALFORMED` warnings — any future parse defect becomes a deletion vector
+  (rows the parser failed to read get wiped with nothing to reinsert). Consider
+  skip-wipe-on-warnings: treat a warning-bearing parse as non-authoritative for that page
+  (skip the wipe, surface a warn), mirroring the empty-fence legacy-row guard's posture.
+- [ ] **P3 — bare-name resolution quarantines even on an exact unique match when prefix siblings exist.**
+  With pages `companies/acme` + `companies/acme-labs`, a bare `"Acme"` yields two
+  `findPrefixCandidates` rows, so `tryUnambiguousPrefixExpansion` declines — even though
+  `companies/acme` is an exact `dir/token` slug match (and may be a unique exact title
+  match). That's an unambiguity signal being wasted. Consider promoting an exact
+  `dir/token` (or exact-title) hit above the sibling-count check in
+  `src/core/entities/resolve.ts`.
+- [ ] **P2 — `scripts/run-verify-parallel.sh` no-gtimeout fallback reports the watchdog's exit code, not the check's.**
+  In the fallback branch, `rc=$?` is captured after `wait "$cap_pid"` (the killed
+  sleep-watchdog, rc=143) rather than after `wait "$pid"` (the actual check) — on a Mac
+  without coreutils every check false-fails with rc=143. Capture `rc` from `wait "$pid"`
+  first, then reap the watchdog.
+- [ ] **P3 — same-target migrate resume with `--force` still skips checkpointed pages after the wipe.**
+  `gbrain migrate --to <engine> --force` wipes the target's pages, but the resume
+  manifest's `completed_slugs` filter still applies, so previously-checkpointed pages are
+  skipped against the now-empty target (pre-existing behavior; the v0.42.59.0 verification
+  warns about it). `--force` should clear the manifest when it matches the same target.
+  Where: `src/commands/migrate-engine.ts`.
+- [ ] **P2 — think residual scope gaps.** Two spots in `src/core/think/index.ts` don't yet
+  inherit the caller's source scope the way the gather stage now does:
+  `persistCitations` resolves citation slugs with an unscoped
+  `SELECT id FROM pages WHERE slug = $1 LIMIT 1` (cross-source slug ambiguity can attach
+  saved evidence to the wrong same-slug page), and the trajectory entity-resolution scalar
+  is `opts.sourceId ?? 'default'` (a federated caller with `allowedSources` but no scalar
+  resolves entities against `default` instead of its grant). Mirror the gather-stage
+  precedence (federated array > scalar > default) at both sites.
+
 ## provider-agnostic follow-ups (filed v0.42.58.0)
 
 Deferred from the provider-agnostic plumbing wave (#1249/#1250/#1292/#2271/#2209).
@@ -170,7 +219,10 @@ job) and sync. See CLAUDE.md "Pace Mode".
   `sourceScopeOpts`) and `code_def` (`operations.ts:4155` — brain-wide raw SQL over
   `content_chunks`; confirm whether brain-wide is intentional before scoping). A remote
   federated client (grant set, dispatch-default `ctx.sourceId='default'`) reads these against
-  `default` or unscoped, not its grant.
+  `default` or unscoped, not its grant. *(Partially done by v0.42.59.0: the engine methods
+  `searchTakes`/`searchTakesVector` now accept the source-scope predicates and the `think`
+  gather path threads them; the standalone `takes_search` op handler still doesn't route
+  through `sourceScopeOpts(ctx)`.)*
   - **Why:** same cross-source correctness/isolation class #2200 targets; a federated client
     can't read chunks/raw-data/versions for an authorized non-default source, `resolve_slugs`
     can fuzzy-resolve across all sources, and `takes_search`/`code_def` query without the grant.
@@ -912,7 +964,7 @@ default-off; these are the gates and extensions before any default flip.
 
 - [ ] **v0.42+: cross-surface ablation before flipping `search.adaptive_return` default.** The gate ships default-off. Before turning it on in any `MODE_BUNDLES` tier, run the recall ablation (adaptive off vs on, recall-preserving caps) across `gbrain eval longmemeval`, `gbrain eval whoknows`, `gbrain eval suspected-contradictions`, and the BrainBench-Real replay (sibling gbrain-evals repo). Confirm recall@k / answer quality does not regress; pick the safe caps; probably flip `tokenmax` first (broadest searchLimit, most noise). On-surface evidence (the PrecisionMemBench precision/recall frontier: off 0.076/0.99, e1/o2 0.40/0.91, e1/o1 0.58/0.82) is recorded in `gbrain-evals/docs/benchmarks/2026-05-29-precisionmembench.md`. Priority: P2.
 - [ ] **v0.42+: fold adaptive-return params into KNOBS_HASH so adaptive-on calls can cache.** v0.41.33.0 skips `hybridSearchCached` entirely when the gate is on (cache-safe but cache-cold). Fold `adaptive_return` enabled + caps + `minKeep` into `knobsHash()` (append-only, bump `KNOBS_HASH_VERSION`) so a gate-on write segregates from a gate-off row and adaptive calls cache correctly. Required before any default flip (else default-on means cache-cold everywhere). See `src/core/search/mode.ts` KNOBS_HASH parts + `return-policy.ts`. Priority: P2 (paired with the default-flip ablation above).
-- [ ] **v0.42+: gentle adaptive gate on `think`'s gather stage (A3).** The plan's A3 decision was a gentler return-gate on `runThink`'s gather candidates (cleaner context, fewer tokens per reasoning call). Deferred because the benefit is unvalidated without a longmemeval answer-quality run, and trimming the answer path (even default-off) carries regression risk. gather fuses 4 streams (page / takes-keyword / takes-vector / graph); the gate must operate on the fused output with a higher min-keep than search, validated on `gbrain eval longmemeval` answer quality (not retrieval precision). Also: `RunThinkOpts` has no `sourceId` today, so think's gather runs unscoped (codex finding) — scope-isolated think needs that plumbing first. Priority: P2.
+- [ ] **v0.42+: gentle adaptive gate on `think`'s gather stage (A3).** The plan's A3 decision was a gentler return-gate on `runThink`'s gather candidates (cleaner context, fewer tokens per reasoning call). Deferred because the benefit is unvalidated without a longmemeval answer-quality run, and trimming the answer path (even default-off) carries regression risk. gather fuses 4 streams (page / takes-keyword / takes-vector / graph); the gate must operate on the fused output with a higher min-keep than search, validated on `gbrain eval longmemeval` answer quality (not retrieval precision). *(The scope plumbing this was gated on landed in v0.42.59.0: `RunThinkOpts` carries `sourceId`/`allowedSources` and `runGather` threads the scope through every stream, so the gate work no longer blocks on it.)* Priority: P2.
 - [ ] **v0.42+: `--explain` human header for adaptive_return.** The decision is in `HybridSearchMeta.adaptive_return` and surfaces in `--json` today. The per-result `explain-formatter.ts` is result-scoped and can't render a per-query meta line; the human `gbrain search --explain` header needs the meta threaded through `cli.ts:formatResult` (it currently only receives `results`). Add a one-line gate-decision header (intent / cap / kept of total). Priority: P3.
 - [ ] **v0.42+: structured-alias / facts-mode fidelity for the PrecisionMemBench eval.** The gbrain-evals benchmark seeds beliefs as pages with aliases in the body (real FTS). A second fidelity that exercises gbrain's structured alias/entity-resolution layer (facts with `valid_until` + entity resolution) would measure gbrain's structured-belief path on the 23 alias cases. Lives in gbrain-evals (`eval/precisionmembench/seed.ts` throws on `fidelity:'structured'` today). Priority: P3.
 
