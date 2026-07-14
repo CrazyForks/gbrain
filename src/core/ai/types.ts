@@ -327,10 +327,13 @@ export interface Recipe {
     fetch?: typeof fetch;
   };
   /**
-   * Optional OpenAI-compatible transport shims for recipe-specific wire quirks.
-   * Kept separate from `resolveOpenAICompatConfig()` so a recipe can install a
-   * static fetch wrapper while preserving the normal `base_urls[recipe.id]`
-   * override chain.
+   * Optional inbound-response rewriter for openai-compatible recipes whose wire
+   * shape needs normalizing before the AI SDK adapter parses it. `fetch` wraps
+   * the transport and MUST be fail-open (return the original response on any
+   * error). Used by DeepSeek to promote `reasoning_content` into `content` when
+   * the reasoner returns an empty `content` (the adapter reads only `content`).
+   * Applied by `applyOpenAICompatConfig`; a `resolveOpenAICompatConfig`-provided
+   * fetch takes precedence when both are present.
    */
   compat?: {
     fetch?: typeof fetch;

@@ -1,54 +1,61 @@
 import type { Recipe } from '../types.ts';
 
 /**
- * DeepSeek-style reasoning models can return the assistant answer in
- * `message.reasoning_content` while leaving `message.content` empty. The AI
- * SDK's OpenAI-compatible adapter reads only `content`, so promote the field
- * before the SDK parses the response.
+ * `deepseek-reasoner` returns its answer in a separate `reasoning_content`
+ * field and leaves `content` empty/whitespace when the whole response was
+ * reasoning. The AI SDK's openai-compatible adapter reads only `content`, so
+ * the model appears to answer with nothing. This transport shim promotes
+ * `reasoning_content` into `content` when `content` is empty, before the
+ * adapter parses the body. Fail-open: any error returns the original response.
+ * Non-streaming JSON chat completions only.
+ *
+ * @internal exported for tests.
  */
+// Cast through `unknown` because TS's `typeof fetch` includes a `preconnect`
+// member the arrow function does not implement (matches azure-openai.ts).
 export const deepseekReasoningContentCompatFetch = (async (
   input: RequestInfo | URL,
   init?: RequestInit,
-) => {
-  const resp = await fetch(input, init);
-  if (!resp.ok) return resp;
-  const ct = resp.headers.get('content-type') ?? '';
-  if (!ct.toLowerCase().includes('application/json')) return resp;
-
+): Promise<Response> => {
+  const res = await fetch(input as any, init as any);
   try {
-    const json: any = await resp.clone().json();
-    if (!json || typeof json !== 'object' || !Array.isArray(json.choices)) {
-      return resp;
-    }
-
+    if (!res.ok) return res;
+    const ctype = res.headers.get('content-type') ?? '';
+    if (!ctype.includes('application/json')) return res;
+    const json = await res.clone().json();
+    const choices = Array.isArray(json?.choices) ? json.choices : [];
     let modified = false;
-    for (const choice of json.choices) {
-      const message = choice?.message;
-      if (!message || typeof message !== 'object') continue;
-      const content = message.content;
-      const reasoningContent = message.reasoning_content;
-      const contentIsEmpty =
-        content === null ||
-        content === undefined ||
-        (typeof content === 'string' && content.trim().length === 0);
-      if (
-        contentIsEmpty &&
-        typeof reasoningContent === 'string' &&
-        reasoningContent.trim().length > 0
-      ) {
-        message.content = reasoningContent;
+    for (const choice of choices) {
+      const msg = choice?.message;
+      if (!msg) continue;
+      // A tool-call turn legitimately carries content:null — the answer is the
+      // tool call, not text. NEVER promote reasoning_content there: DeepSeek's
+      // chain-of-thought must not be fed back to the model (it would be
+      // persisted as assistant text and replayed every subsequent turn,
+      // contaminating context and inflating tokens). Only promote on a terminal
+      // text turn whose content is empty.
+      const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+      const content = msg.content;
+      const reasoning = msg.reasoning_content;
+      const contentEmpty = content == null || (typeof content === 'string' && content.trim() === '');
+      if (!hasToolCalls && contentEmpty && typeof reasoning === 'string' && reasoning.trim() !== '') {
+        msg.content = reasoning;
         modified = true;
       }
     }
-
-    if (!modified) return resp;
+    if (!modified) return res;
+    // Rebuild with a fresh header set: the body length changed, so the
+    // upstream content-length / content-encoding would now be wrong.
+    const headers = new Headers(res.headers);
+    headers.delete('content-length');
+    headers.delete('content-encoding');
     return new Response(JSON.stringify(json), {
-      status: resp.status,
-      statusText: resp.statusText,
-      headers: resp.headers,
+      status: res.status,
+      statusText: res.statusText,
+      headers,
     });
   } catch {
-    return resp;
+    return res;
   }
 }) as unknown as typeof fetch;
 
