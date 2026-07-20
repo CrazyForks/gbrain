@@ -1767,8 +1767,17 @@ export async function hybridSearchCached(
         ...(hit.meta?.embedding_column ? { embedding_column: hit.meta.embedding_column } : {}),
         ...(hit.meta?.adaptive_return ? { adaptive_return: hit.meta.adaptive_return } : {}),
         ...(hit.meta?.autocut ? { autocut: hit.meta.autocut } : {}),
+        // Per-call budget: prefer the STORED budget record, which carries
+        // the true dropped count from the write-time cut — the
+        // re-application above ran on an already-cut set and reads
+        // dropped=0 (same masking as the miss path's finalMeta). Safe
+        // unconditionally: tokenBudget is folded into knobsHash (`tb=`),
+        // so a hit only ever serves a lookup with the identical resolved
+        // budget as the write — the outer pass can never cut further.
+        // budgetMeta stays as the fallback for legacy rows stored without
+        // a budget record.
         ...(opts?.tokenBudget && opts.tokenBudget > 0
-          ? { token_budget: budgetMeta }
+          ? { token_budget: hit.meta?.token_budget ?? budgetMeta }
           : {}),
       };
       try {
@@ -1836,8 +1845,15 @@ export async function hybridSearchCached(
     ...(innerMeta?.embedding_column ? { embedding_column: innerMeta.embedding_column } : {}),
     ...(innerMeta?.adaptive_return ? { adaptive_return: innerMeta.adaptive_return } : {}),
     ...(innerMeta?.autocut ? { autocut: innerMeta.autocut } : {}),
+    // Per-call budget: prefer the INNER meta's budget record. The inner
+    // hybridSearch already enforced the same resolved budget (per-call wins
+    // in resolveSearchMode), so the re-application above sees an
+    // already-cut set and its meta reads dropped=0 — masking the real cut
+    // from onMeta consumers (the `dropped` under-report the restored
+    // search-lite test caught). The outer pass stays as the enforcement
+    // for the cache-HIT path, where no inner run exists.
     ...(opts?.tokenBudget && opts.tokenBudget > 0
-      ? { token_budget: budgetMeta }
+      ? { token_budget: innerMeta?.token_budget ?? budgetMeta }
       : {}),
   };
   try {
