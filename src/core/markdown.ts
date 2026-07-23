@@ -44,6 +44,13 @@ export interface ParsedMarkdown {
   timeline: string;
   slug: string;
   type: PageType;
+  /**
+   * #1035: true when `type` came from an explicit frontmatter `type:` field,
+   * false when it was inferred from the file path (or defaulted to 'concept').
+   * Importers use this to preserve an existing page's type on round-trip:
+   * explicit frontmatter type is an override; absence means "don't change it".
+   */
+  typeExplicit?: boolean;
   title: string;
   tags: string[];
   /** Present iff opts.validate. Empty array means no errors. */
@@ -132,7 +139,8 @@ export function parseMarkdown(
   // coerceFrontmatterString turns a scalar/date into a usable string (a date slug
   // `2024-06-01` is legitimate); the NON_STRING_FIELD lint finding below still
   // surfaces the un-quoted field so it can be cleaned up.
-  const type = coerceFrontmatterString(frontmatter.type) || (
+  const explicitType = coerceFrontmatterString(frontmatter.type);
+  const type = explicitType || (
     opts?.activePack ? inferTypeFromPack(filePath, opts.activePack) : inferType(filePath)
   );
   // #2446: title precedence is frontmatter `title:` > the body's first H1 >
@@ -160,6 +168,7 @@ export function parseMarkdown(
     timeline: timeline.trim(),
     slug,
     type,
+    typeExplicit: explicitType !== '',
     title,
     tags,
   };
