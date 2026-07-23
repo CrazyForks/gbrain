@@ -3462,7 +3462,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   return {
     status: 'synced',
     fromCommit: lastCommit,
-    toCommit: headCommit,
+    toCommit: pin,
     added: filtered.added.length,
     modified: filtered.modified.length,
     deleted: filtered.deleted.length,
