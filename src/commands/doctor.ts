@@ -7777,71 +7777,27 @@ export async function runRemediationPlan(
     return;
   }
 
-  for (const line of renderRemediationPlanLines(plan, targetScore)) {
-    console.log(line);
-  }
-}
-
-/**
- * Human-render the remediation plan into a sequence of console lines.
- * Exported for unit-test access — `runRemediationPlan` consumes it
- * verbatim and only adds the JSON-mode short-circuit.
- *
- * Gating the "at target" line on `brain_score_current >= targetScore`
- * is load-bearing: when the plan is empty AND the target is unreachable,
- * the prior shape printed both "Target unreachable: …" and "Brain is at
- * target" back-to-back, which contradicted itself and hid the real next
- * step (manual prereq config to lift `max_reachable_score`).
- */
-export function renderRemediationPlanLines(
-  plan: RemediationPlanShape,
-  targetScore: number,
-): string[] {
-  const lines: string[] = [];
-  lines.push(`Brain score: ${plan.brain_score_current}/100 → target ${targetScore}`);
+  // Human output
+  console.log(`Brain score: ${plan.brain_score_current}/100 → target ${targetScore}`);
   if (plan.target_unreachable) {
-    lines.push(`Target unreachable: max with autonomous remediation is ${plan.max_reachable_score}/100.`);
+    console.log(`Target unreachable: max with autonomous remediation is ${plan.max_reachable_score}/100.`);
   }
   if (plan.plan.length === 0) {
-    if (plan.brain_score_current >= targetScore) {
-      lines.push('No remediations needed. Brain is at target.');
-    }
-    // When brain_score < targetScore and plan is empty, the unreachable
-    // line (if applicable) is the user-facing explanation; the blocked-
-    // checks block below surfaces the manual gap. Don't follow with a
-    // misleading "at target" claim.
+    console.log('No remediations needed. Brain is at target.');
   } else {
-    lines.push(`Plan: ${plan.plan.length} step(s), est ${plan.est_total_seconds}s, est $${plan.est_total_usd_cost.toFixed(2)}`);
+    console.log(`Plan: ${plan.plan.length} step(s), est ${plan.est_total_seconds}s, est $${plan.est_total_usd_cost.toFixed(2)}`);
     for (const step of plan.plan) {
       const protectedMark = step.protected ? ' [PROTECTED]' : '';
       const costMark = step.est_usd_cost ? ` ($${step.est_usd_cost.toFixed(2)})` : '';
-      lines.push(`  ${step.step}. [${step.severity}] ${step.job}${protectedMark} — ${step.rationale}${costMark}`);
+      console.log(`  ${step.step}. [${step.severity}] ${step.job}${protectedMark} — ${step.rationale}${costMark}`);
     }
   }
   if (plan.blocked.length > 0) {
-    lines.push(`\nBlocked checks (prereq missing):`);
+    console.log(`\nBlocked checks (prereq missing):`);
     for (const b of plan.blocked) {
-      lines.push(`  - ${b.check}: ${b.reason}`);
+      console.log(`  - ${b.check}: ${b.reason}`);
     }
   }
-  return lines;
-}
-
-interface RemediationPlanShape {
-  brain_score_current: number;
-  target_unreachable: boolean;
-  max_reachable_score: number;
-  plan: Array<{
-    step: number;
-    severity: string;
-    job: string;
-    protected?: boolean;
-    est_usd_cost?: number;
-    rationale: string;
-  }>;
-  est_total_seconds: number;
-  est_total_usd_cost: number;
-  blocked: Array<{ check: string; reason: string }>;
 }
 
 /**
